@@ -1,0 +1,59 @@
+CompileFlags:
+  # Ensure clangd parses with the standard/compiler you build with.
+  # Adjust the path if you pin a specific clang via your devenv/toolchain.
+  Add:
+    - -std=c++26
+    - -Wall
+    - -Wextra
+  # Strip flags that the build system may pass but clangd doesn't understand.
+  Remove:
+    - -fmodules-ts
+  Compiler: clang++
+
+Index:
+  Background: Build
+  StandardLibrary: Yes
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
+  Designators: Yes
+
+Hover:
+  ShowAKA: Yes
+
+Completion:
+  AllScopes: Yes
+
+Diagnostics:
+  # Surface unused includes/missing includes, but only as hints so they
+  # don't drown real work.
+  UnusedIncludes: Strict
+  MissingIncludes: Strict
+  ClangTidy:
+    # A pragmatic, low-noise set: catch real bugs and obvious modernization
+    # without the pedantic/opinionated checks that produce constant warnings.
+    Add:
+      - bugprone-*
+      - performance-*
+      - modernize-*
+      - readability-*
+      - cppcoreguidelines-*
+      - misc-*
+    Remove:
+      # Too noisy / stylistically opinionated for everyday work.
+      - modernize-use-trailing-return-type
+      - readability-magic-numbers
+      - cppcoreguidelines-avoid-magic-numbers
+      - readability-identifier-length
+      - readability-named-parameter
+      - misc-non-private-member-variables-in-classes
+      - cppcoreguidelines-non-private-member-variables-in-classes
+      - cppcoreguidelines-pro-bounds-pointer-arithmetic
+      - cppcoreguidelines-pro-type-vararg
+      - cppcoreguidelines-avoid-non-const-global-variables
+      - bugprone-easily-swappable-parameters
+      - modernize-use-nodiscard
+    CheckOptions:
+      readability-braces-around-statements.ShortStatementLines: 2
