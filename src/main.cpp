@@ -1,39 +1,44 @@
-// Basic Directional visualization demo (mirrors Directional tutorial 101,
-// "Glyph Rendering"): load a triangle mesh, attach a precomputed face-based
-// tangent vector field plus its singularities, and render it interactively
-// through Directional's Polyscope-backed viewer.
-//
-// Everything here builds against the Eigen and Polyscope that *this* project
-// pulls in via CPM; Directional is consumed header-only on top of them.
+#include "face_field_operators.h"
+#include "geodesic_field.h"
+#include "weaving_mesh.h"
 
-#include <directional/CartesianField.h>
-#include <directional/PCFaceTangentBundle.h>
-#include <directional/TriMesh.h>
 #include <directional/directional_viewer.h>
-#include <directional/readOFF.h>
-#include <directional/read_raw_field.h>
-#include <directional/read_singularities.h>
+
+#include <string>
+
+WeavingMesh weaving_mesh(std::string(DIRECTIONAL_DATA_PATH) + "/fertility.obj");
+GeodesicField geodesic_field(weaving_mesh);
+FaceFieldOperators field_operators
+    = assemble_face_field_operators(weaving_mesh);
+directional::DirectionalViewer viewer;
+polyscope::SurfaceFaceScalarQuantity* curl_quantity = nullptr;
+
+void callback()
+{
+    if (ImGui::Button("perturb field")) {
+        geodesic_field.perturb_random();
+        viewer.set_cartesian_field(geodesic_field.field());
+        Eigen::VectorXd const curl = geodesic_field.face_curl();
+        curl_quantity->updateData(curl);
+        curl_quantity->setMapRange({ curl.minCoeff(), curl.maxCoeff() });
+    }
+    if (ImGui::Button("toggle curl map")) {
+        curl_quantity->setEnabled(!curl_quantity->isEnabled());
+    }
+}
 
 int main()
 {
-    directional::TriMesh mesh;
-    directional::PCFaceTangentBundle ftb;
-    directional::CartesianField field;
-    directional::DirectionalViewer viewer;
+    (void)field_operators;
 
-    int N = 0; // degree of the field (filled in by read_raw_field)
-
-    // Load the mesh and a precomputed N-RoSy field defined on its faces.
-    directional::readOFF(DIRECTIONAL_DATA_PATH "/bumpy.off", mesh);
-    ftb.init(mesh);
-    directional::read_raw_field(DIRECTIONAL_DATA_PATH "/bumpy.rawfield", ftb, N, field);
-    directional::read_singularities(DIRECTIONAL_DATA_PATH "/bumpy.sings", field);
-
-    // Hand it all to Directional's viewer, which drives Polyscope under the hood.
     viewer.init();
-    viewer.set_surface_mesh(mesh);
-    viewer.set_cartesian_field(field);
-    viewer.launch(); // opens the window; blocks until closed
+    viewer.set_surface_mesh(weaving_mesh.mesh());
+    viewer.set_cartesian_field(geodesic_field.field());
+    curl_quantity = viewer.set_surface_face_data(
+        geodesic_field.face_curl(), "curl");
+    curl_quantity->setEnabled(false);
+    viewer.set_callback(callback);
+    viewer.launch();
 
     return 0;
 }
