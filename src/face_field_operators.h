@@ -7,8 +7,10 @@
 
 #include <Eigen/Sparse>
 
+#include <array>
 #include <cmath>
 #include <complex>
+#include <ranges>
 #include <vector>
 
 struct FaceFieldOperators {
@@ -39,13 +41,13 @@ inline Eigen::Matrix2d rotation_from_connection(std::complex<double> const r)
 // The vertex of `face` that does not lie on the edge (vertex_a, vertex_b).
 // That vertex is where the angle opposite the edge sits.
 inline int opposite_vertex_in_face(
-    directional::TriMesh const& mesh,
+    MeshTables const& tables,
     int face,
     int vertex_a,
     int vertex_b)
 {
-    for (int corner = 0; corner < 3; ++corner) {
-        int const vertex = mesh.F(face, corner);
+    for (int const corner : std::views::iota(0, 3)) {
+        int const vertex = tables.faces(face, corner);
         if (vertex != vertex_a && vertex != vertex_b) {
             return vertex;
         }
@@ -55,13 +57,17 @@ inline int opposite_vertex_in_face(
 
 // cot of the angle at `apex` in triangle apex–vertex_a–vertex_b.
 inline double cotan_at_apex(
-    directional::TriMesh const& mesh,
+    MeshTables const& tables,
     int apex,
     int vertex_a,
     int vertex_b)
 {
-    Eigen::RowVector3d const to_a = mesh.V.row(vertex_a) - mesh.V.row(apex);
-    Eigen::RowVector3d const to_b = mesh.V.row(vertex_b) - mesh.V.row(apex);
+    Eigen::RowVector3d const to_a =
+        tables.vertex_positions.row(vertex_a)
+        - tables.vertex_positions.row(apex);
+    Eigen::RowVector3d const to_b =
+        tables.vertex_positions.row(vertex_b)
+        - tables.vertex_positions.row(apex);
     double const area_twice = to_a.cross(to_b).norm();
     return to_a.dot(to_b) / std::max(area_twice, 1e-16);
 }
@@ -70,11 +76,12 @@ inline FaceFieldOperators assemble_face_field_operators(
     WeavingMesh const& weaving_mesh)
 {
     directional::TriMesh const& mesh = weaving_mesh.mesh();
+    MeshTables const tables = mesh_tables(mesh);
     directional::PCFaceTangentBundle const& tangent_bundle =
         weaving_mesh.tangent_bundle();
 
-    int const face_count = mesh.F.rows();
-    int const interior_edge_count = mesh.innerEdges.size();
+    int const face_count = tables.faces.rows();
+    int const interior_edge_count = tables.interior_edges.size();
 
     FaceFieldOperators operators;
 
@@ -83,8 +90,8 @@ inline FaceFieldOperators assemble_face_field_operators(
 
     std::vector<Eigen::Triplet<double>> mass_entries;
     mass_entries.reserve(2 * face_count);
-    for (int face = 0; face < face_count; ++face) {
-        double const area = mesh.faceAreas(face);
+    for (int const face : std::views::iota(0, face_count)) {
+        double const area = tables.face_areas(face);
         mass_entries.emplace_back(2 * face, 2 * face, area);
         mass_entries.emplace_back(2 * face + 1, 2 * face + 1, area);
     }
@@ -95,24 +102,24 @@ inline FaceFieldOperators assemble_face_field_operators(
     std::vector<Eigen::Triplet<double>> smoothness_entries;
     constexpr double omega_floor = 1e-8;
 
-    for (int interior = 0; interior < interior_edge_count; ++interior) {
-        int const edge = mesh.innerEdges(interior);
-        int const left_face = mesh.EF(edge, 0);
-        int const right_face = mesh.EF(edge, 1);
-        int const edge_start = mesh.EV(edge, 0);
-        int const edge_end = mesh.EV(edge, 1);
+    for (int const interior : std::views::iota(0, interior_edge_count)) {
+        int const edge = tables.interior_edges(interior);
+        int const left_face = tables.edge_faces(edge, 0);
+        int const right_face = tables.edge_faces(edge, 1);
+        int const edge_start = tables.edge_vertices(edge, 0);
+        int const edge_end = tables.edge_vertices(edge, 1);
 
         int const left_apex =
-            opposite_vertex_in_face(mesh, left_face, edge_start, edge_end);
+            opposite_vertex_in_face(tables, left_face, edge_start, edge_end);
         int const right_apex =
-            opposite_vertex_in_face(mesh, right_face, edge_start, edge_end);
+            opposite_vertex_in_face(tables, right_face, edge_start, edge_end);
 
         // ω = (cot α + cot β)/2, α,β opposite the shared edge.
         // Reciprocal 1/ω is the dual-graph weight on this face-adjacency.
         double omega =
             0.5
-            * (cotan_at_apex(mesh, left_apex, edge_start, edge_end)
-               + cotan_at_apex(mesh, right_apex, edge_start, edge_end));
+            * (cotan_at_apex(tables, left_apex, edge_start, edge_end)
+               + cotan_at_apex(tables, right_apex, edge_start, edge_end));
         omega = std::max(omega, omega_floor);
         double const dual_weight = 1.0 / omega;
 
@@ -127,13 +134,13 @@ inline FaceFieldOperators assemble_face_field_operators(
         Eigen::Matrix4d const local_energy =
             dual_weight * stamp.transpose() * stamp;
 
-        int const stacked_cols[4] = {
+        std::array const stacked_cols{
             2 * left_face,
             2 * left_face + 1,
             2 * right_face,
             2 * right_face + 1};
-        for (int row = 0; row < 4; ++row) {
-            for (int col = 0; col < 4; ++col) {
+        for (int const row : std::views::iota(0, 4)) {
+            for (int const col : std::views::iota(0, 4)) {
                 if (local_energy(row, col) != 0.0) {
                     smoothness_entries.emplace_back(
                         stacked_cols[row],
@@ -157,4 +164,13 @@ inline Eigen::VectorXd flatten_intrinsic(
     directional::CartesianField const& field)
 {
     return field.flatten(/*isIntrinsic=*/true);
+}
+
+inline Eigen::MatrixXd unflatten_intrinsic(
+    Eigen::VectorXd const& stacked,
+    int face_count)
+{
+    using RowMajorF2 =
+        Eigen::Matrix<double, Eigen::Dynamic, 2, Eigen::RowMajor>;
+    return Eigen::Map<RowMajorF2 const>(stacked.data(), face_count, 2);
 }
