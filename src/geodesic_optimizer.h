@@ -5,9 +5,9 @@
 
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
-#include <Eigen/SparseQR>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <optional>
 #include <print>
@@ -24,6 +24,8 @@ public:
         , field_operators_(field_operators)
         , residual_(Eigen::VectorXd::Zero(
               field_operators.mass_matrix.rows()))
+        // M is diag(A_f, A_f, ...): each face area appears twice.
+        , total_area_(field_operators.mass_matrix.diagonal().sum() / 2.0)
     {
     }
 
@@ -39,22 +41,42 @@ public:
         return take_step(lambda, false, 0);
     }
 
+    // `epsilon` is an average per-face change: the stop test compares
+    // ‖Δu‖_M against ε·√(total area), so it is independent of mesh scale.
     int run(
         double lambda,
         double epsilon,
         int max_iterations,
         bool enforce_curl)
     {
+        using clock = std::chrono::steady_clock;
+        auto const level_start = clock::now();
+        solve_seconds_ = 0.0;
+        factor_seconds_ = 0.0;
+
+        double const threshold = epsilon * std::sqrt(total_area_);
         int iterations = 0;
         for (int const iteration :
             std::views::iota(1, max_iterations + 1)) {
             iterations = iteration;
             double const field_change =
                 take_step(lambda, enforce_curl, iteration);
-            if (field_change < epsilon) {
+            if (field_change < threshold) {
                 break;
             }
         }
+
+        double const level_seconds =
+            std::chrono::duration<double>(clock::now() - level_start).count();
+        std::println(
+            "λ={}  {}  level done: {} iterations, factor {:.3f}s, "
+            "solves {:.3f}s, total {:.3f}s",
+            lambda,
+            enforce_curl ? "C" : "no-C",
+            iterations,
+            factor_seconds_,
+            solve_seconds_,
+            level_seconds);
         return iterations;
     }
 
@@ -93,12 +115,21 @@ public:
 private:
     // App. B typesets (M + λ L) δ = -λ L (u+δ). L is NSD and δ is unknown:
     // both wrong. Stationarity of Eq. (5) is this KKT with Q = -L (PSD):
-    //   [ M+λQ   Cᵀ ] [δ̃]   [ -λ Q u ]
-    //   [ C       0 ] [μ] = [ -C u   ]
-    // SIGGRAPH uses Eigen::SPQR (SuiteSparse). Eigen::SparseQR is the
-    // same rank-revealing QR; δ̃ is unique either way.
+    //   [ M+λQ   Cᵀ  ] [δ̃]   [ -λ Q u ]
+    //   [ C     -εI  ] [μ] = [ -C u   ]
+    // On a closed surface rank(C) = |E_int| − 1, so with a zero (2,2)
+    // block the KKT matrix is singular (δ̃ unique, μ not). The paper
+    // sidesteps that with a rank-revealing sparse QR (SuiteSparse SPQR);
+    // Eigen's SparseQR is far slower. Instead we stamp −εI: the matrix
+    // becomes quasi-definite (SPD block, negative-definite block), which
+    // has a stable LDLᵀ factorization under any symmetric ordering, so
+    // SimplicialLDLT applies directly. The price is C(u+δ̃) = εμ instead
+    // of 0, negligible for ε ≪ scale of M+λQ.
     void factor_kkt(double lambda)
     {
+        using clock = std::chrono::steady_clock;
+        auto const start = clock::now();
+
         Eigen::SparseMatrix<double> const& mass =
             field_operators_.mass_matrix;
         Eigen::SparseMatrix<double> const& smoothness =
@@ -113,8 +144,17 @@ private:
         int const curl_rows = curl.rows();
         int const kkt_size = stacked_size + curl_rows;
 
+        // ε is tied to the mass scale (mean face area), not to M+λQ: the
+        // smoothness weights 1/ω can be orders of magnitude larger than M
+        // on meshes with near-right angles, and an ε scaled by them lets
+        // the constraint drift by O(ε‖μ‖).
+        constexpr double relative_regularization = 1e-10;
+        double const regularization = relative_regularization
+            * mass.diagonal().sum() / static_cast<double>(stacked_size);
+
         std::vector<Eigen::Triplet<double>> entries;
-        entries.reserve(hessian.nonZeros() + 2 * curl.nonZeros());
+        entries.reserve(
+            hessian.nonZeros() + 2 * curl.nonZeros() + curl_rows);
 
         for (int col = 0; col < hessian.outerSize(); ++col) {
             for (Eigen::SparseMatrix<double>::InnerIterator it(hessian, col);
@@ -133,6 +173,10 @@ private:
                     it.col(), it.row() + stacked_size, it.value());
             }
         }
+        for (int const row : std::views::iota(0, curl_rows)) {
+            entries.emplace_back(
+                stacked_size + row, stacked_size + row, -regularization);
+        }
 
         Eigen::SparseMatrix<double> kkt(kkt_size, kkt_size);
         kkt.setFromTriplets(entries.begin(), entries.end());
@@ -140,14 +184,19 @@ private:
 
         solver_.compute(kkt);
         if (solver_.info() != Eigen::Success) {
-            throw std::runtime_error("KKT SparseQR factorization failed");
+            throw std::runtime_error("KKT LDLT factorization failed");
         }
 
         factored_lambda_ = lambda;
+        factor_seconds_ +=
+            std::chrono::duration<double>(clock::now() - start).count();
     }
 
     void factor_unconstrained(double lambda)
     {
+        using clock = std::chrono::steady_clock;
+        auto const start = clock::now();
+
         Eigen::SparseMatrix<double> const hessian =
             field_operators_.mass_matrix
             + lambda * field_operators_.smoothness_matrix;
@@ -157,6 +206,8 @@ private:
                 "unconstrained LDLT factorization failed");
         }
         unconstrained_factored_lambda_ = lambda;
+        factor_seconds_ +=
+            std::chrono::duration<double>(clock::now() - start).count();
     }
 
     [[nodiscard]] double take_step(
@@ -164,6 +215,8 @@ private:
         bool enforce_curl,
         int iteration)
     {
+        using clock = std::chrono::steady_clock;
+
         Eigen::VectorXd design_field =
             flatten_intrinsic(geodesic_field_.field());
         Eigen::VectorXd const previous = design_field;
@@ -182,14 +235,26 @@ private:
             Eigen::VectorXd rhs(stacked_size + curl_rows);
             rhs.head(stacked_size) = -lambda * smoothness * design_field;
             rhs.tail(curl_rows) = -curl * design_field;
+
+            auto const solve_start = clock::now();
             Eigen::VectorXd const solution = solver_.solve(rhs);
+            solve_seconds_ += std::chrono::duration<double>(
+                clock::now() - solve_start)
+                                  .count();
+            if (solver_.info() != Eigen::Success) {
+                throw std::runtime_error("KKT LDLT solve failed");
+            }
             corrected = design_field + solution.head(stacked_size);
         } else {
             if (unconstrained_factored_lambda_ != lambda) {
                 factor_unconstrained(lambda);
             }
+            auto const solve_start = clock::now();
             Eigen::VectorXd const delta_tilde = unconstrained_solver_.solve(
                 -lambda * smoothness * design_field);
+            solve_seconds_ += std::chrono::duration<double>(
+                clock::now() - solve_start)
+                                  .count();
             if (unconstrained_solver_.info() != Eigen::Success) {
                 throw std::runtime_error("unconstrained LDLT solve failed");
             }
@@ -261,10 +326,10 @@ private:
     GeodesicField& geodesic_field_;
     FaceFieldOperators const& field_operators_;
     Eigen::VectorXd residual_;
-    Eigen::SparseQR<
-        Eigen::SparseMatrix<double>,
-        Eigen::COLAMDOrdering<int>>
-        solver_;
+    double total_area_;
+    double factor_seconds_ = 0.0;
+    double solve_seconds_ = 0.0;
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver_;
     Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>>
         unconstrained_solver_;
     std::optional<double> factored_lambda_;

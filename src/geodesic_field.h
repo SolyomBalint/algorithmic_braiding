@@ -3,6 +3,7 @@
 #include "weaving_mesh.h"
 
 #include <directional/CartesianField.h>
+#include <directional/principal_matching.h>
 
 #include <Eigen/Dense>
 
@@ -36,6 +37,7 @@ public:
         }
 
         field_.set_intrinsic_field(int_field);
+        update_singularities();
     }
 
     void perturb_random()
@@ -55,7 +57,10 @@ public:
         }
 
         field_.set_intrinsic_field(int_field);
+        update_singularities();
     }
+
+    void update_singularities() { directional::principal_matching(field_); }
 
     [[nodiscard]] directional::CartesianField const& field() const
     {
