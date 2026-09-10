@@ -17,6 +17,13 @@ public:
         tangent_bundle_.init(mesh_);
     }
 
+    // Build from explicit geometry (used for the punctured sub-mesh).
+    WeavingMesh(Eigen::MatrixXd const& vertices, Eigen::MatrixXi const& faces)
+    {
+        mesh_.set_mesh(vertices, faces);
+        tangent_bundle_.init(mesh_);
+    }
+
     WeavingMesh(WeavingMesh const&) = delete;
     WeavingMesh& operator=(WeavingMesh const&) = delete;
     WeavingMesh(WeavingMesh&&) = delete;

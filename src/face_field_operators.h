@@ -72,6 +72,98 @@ inline double cotan_at_apex(
     return to_a.dot(to_b) / std::max(area_twice, 1e-16);
 }
 
+// ω_e = (cot α + cot β)/2 with α, β the angles opposite edge e in its two
+// faces (one term on a boundary edge). Floored so 1/ω stays finite on
+// right-angled quad diagonals (see memory: median-relative floors hurt).
+inline constexpr double omega_floor = 1e-8;
+
+inline double edge_cotan_weight(MeshTables const& tables, int edge)
+{
+    int const edge_start = tables.edge_vertices(edge, 0);
+    int const edge_end = tables.edge_vertices(edge, 1);
+    double omega = 0.0;
+    for (int const side : std::views::iota(0, 2)) {
+        int const face = tables.edge_faces(edge, side);
+        if (face < 0) {
+            continue;
+        }
+        int const apex =
+            opposite_vertex_in_face(tables, face, edge_start, edge_end);
+        omega += 0.5 * cotan_at_apex(tables, apex, edge_start, edge_end);
+    }
+    return std::max(omega, omega_floor);
+}
+
+// Q_s : |F| × |F| (PSD).  sᵀ Q_s s = Σ_{interior e} (1/ω_e) (s_right − s_left)².
+// The face-based scalar Dirichlet energy of App. B (−L_F on scalars).
+inline Eigen::SparseMatrix<double> face_scalar_laplacian(
+    MeshTables const& tables,
+    double weight_floor = omega_floor)
+{
+    int const face_count = tables.faces.rows();
+    std::vector<Eigen::Triplet<double>> entries;
+    entries.reserve(4 * tables.interior_edges.size());
+    for (int const interior :
+        std::views::iota(0, static_cast<int>(tables.interior_edges.size()))) {
+        int const edge = tables.interior_edges(interior);
+        int const left_face = tables.edge_faces(edge, 0);
+        int const right_face = tables.edge_faces(edge, 1);
+        double const weight =
+            1.0 / std::max(edge_cotan_weight(tables, edge), weight_floor);
+        entries.emplace_back(left_face, left_face, weight);
+        entries.emplace_back(right_face, right_face, weight);
+        entries.emplace_back(left_face, right_face, -weight);
+        entries.emplace_back(right_face, left_face, -weight);
+    }
+    Eigen::SparseMatrix<double> laplacian(face_count, face_count);
+    laplacian.setFromTriplets(entries.begin(), entries.end());
+    return laplacian;
+}
+
+// Quasi-definite KKT matrix
+//   [ H    Bᵀ ]
+//   [ B   −εI ]
+// for an SPD H and a constraint matrix B. With ε > 0 the block matrix has a
+// stable LDLᵀ factorization under any symmetric ordering, so SimplicialLDLT
+// applies directly; the constraint is satisfied up to ε‖μ‖.
+inline Eigen::SparseMatrix<double> assemble_quasi_definite_kkt(
+    Eigen::SparseMatrix<double> const& hessian,
+    Eigen::SparseMatrix<double> const& constraint,
+    double regularization)
+{
+    int const primal_size = hessian.rows();
+    int const constraint_rows = constraint.rows();
+    int const kkt_size = primal_size + constraint_rows;
+
+    std::vector<Eigen::Triplet<double>> entries;
+    entries.reserve(
+        hessian.nonZeros() + 2 * constraint.nonZeros() + constraint_rows);
+
+    for (int col = 0; col < hessian.outerSize(); ++col) {
+        for (Eigen::SparseMatrix<double>::InnerIterator it(hessian, col); it;
+             ++it) {
+            entries.emplace_back(it.row(), it.col(), it.value());
+        }
+    }
+    for (int col = 0; col < constraint.outerSize(); ++col) {
+        for (Eigen::SparseMatrix<double>::InnerIterator it(constraint, col);
+             it;
+             ++it) {
+            entries.emplace_back(it.row() + primal_size, it.col(), it.value());
+            entries.emplace_back(it.col(), it.row() + primal_size, it.value());
+        }
+    }
+    for (int const row : std::views::iota(0, constraint_rows)) {
+        entries.emplace_back(
+            primal_size + row, primal_size + row, -regularization);
+    }
+
+    Eigen::SparseMatrix<double> kkt(kkt_size, kkt_size);
+    kkt.setFromTriplets(entries.begin(), entries.end());
+    kkt.makeCompressed();
+    return kkt;
+}
+
 inline FaceFieldOperators assemble_face_field_operators(
     WeavingMesh const& weaving_mesh)
 {
@@ -100,28 +192,14 @@ inline FaceFieldOperators assemble_face_field_operators(
         mass_entries.begin(), mass_entries.end());
 
     std::vector<Eigen::Triplet<double>> smoothness_entries;
-    constexpr double omega_floor = 1e-8;
 
     for (int const interior : std::views::iota(0, interior_edge_count)) {
         int const edge = tables.interior_edges(interior);
         int const left_face = tables.edge_faces(edge, 0);
         int const right_face = tables.edge_faces(edge, 1);
-        int const edge_start = tables.edge_vertices(edge, 0);
-        int const edge_end = tables.edge_vertices(edge, 1);
 
-        int const left_apex =
-            opposite_vertex_in_face(tables, left_face, edge_start, edge_end);
-        int const right_apex =
-            opposite_vertex_in_face(tables, right_face, edge_start, edge_end);
-
-        // ω = (cot α + cot β)/2, α,β opposite the shared edge.
         // Reciprocal 1/ω is the dual-graph weight on this face-adjacency.
-        double omega =
-            0.5
-            * (cotan_at_apex(tables, left_apex, edge_start, edge_end)
-               + cotan_at_apex(tables, right_apex, edge_start, edge_end));
-        omega = std::max(omega, omega_floor);
-        double const dual_weight = 1.0 / omega;
+        double const dual_weight = 1.0 / edge_cotan_weight(tables, edge);
 
         // Unfold left onto right, then compare intrinsic 2-vectors.
         Eigen::Matrix2d const transport =

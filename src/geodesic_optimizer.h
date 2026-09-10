@@ -140,47 +140,16 @@ private:
         Eigen::SparseMatrix<double> const hessian =
             mass + lambda * smoothness;
 
-        int const stacked_size = hessian.rows();
-        int const curl_rows = curl.rows();
-        int const kkt_size = stacked_size + curl_rows;
-
         // ε is tied to the mass scale (mean face area), not to M+λQ: the
         // smoothness weights 1/ω can be orders of magnitude larger than M
         // on meshes with near-right angles, and an ε scaled by them lets
         // the constraint drift by O(ε‖μ‖).
         constexpr double relative_regularization = 1e-10;
         double const regularization = relative_regularization
-            * mass.diagonal().sum() / static_cast<double>(stacked_size);
+            * mass.diagonal().sum() / static_cast<double>(hessian.rows());
 
-        std::vector<Eigen::Triplet<double>> entries;
-        entries.reserve(
-            hessian.nonZeros() + 2 * curl.nonZeros() + curl_rows);
-
-        for (int col = 0; col < hessian.outerSize(); ++col) {
-            for (Eigen::SparseMatrix<double>::InnerIterator it(hessian, col);
-                 it;
-                 ++it) {
-                entries.emplace_back(it.row(), it.col(), it.value());
-            }
-        }
-        for (int col = 0; col < curl.outerSize(); ++col) {
-            for (Eigen::SparseMatrix<double>::InnerIterator it(curl, col);
-                 it;
-                 ++it) {
-                entries.emplace_back(
-                    it.row() + stacked_size, it.col(), it.value());
-                entries.emplace_back(
-                    it.col(), it.row() + stacked_size, it.value());
-            }
-        }
-        for (int const row : std::views::iota(0, curl_rows)) {
-            entries.emplace_back(
-                stacked_size + row, stacked_size + row, -regularization);
-        }
-
-        Eigen::SparseMatrix<double> kkt(kkt_size, kkt_size);
-        kkt.setFromTriplets(entries.begin(), entries.end());
-        kkt.makeCompressed();
+        Eigen::SparseMatrix<double> const kkt =
+            assemble_quasi_definite_kkt(hessian, curl, regularization);
 
         solver_.compute(kkt);
         if (solver_.info() != Eigen::Success) {

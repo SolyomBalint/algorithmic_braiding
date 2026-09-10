@@ -3,6 +3,8 @@
 #include "weaving_mesh.h"
 
 #include <directional/CartesianField.h>
+#include <directional/power_field.h>
+#include <directional/power_to_raw.h>
 #include <directional/principal_matching.h>
 
 #include <Eigen/Dense>
@@ -56,6 +58,39 @@ public:
             int_field(face, 1) = rotated.imag();
         }
 
+        field_.set_intrinsic_field(int_field);
+        update_singularities();
+    }
+
+    // Smooth initial field ŵ⁰ (§4.1.3, Table 1): the Dirichlet-smoothest
+    // unit field, as in Knöppel et al. 2013, computed as Directional's
+    // N = 1 power field (one face pinned, no other constraints) and
+    // normalized. Starting Algorithm 1 from this instead of noise gives the
+    // few singularities the paper's examples have; a random start leaves a
+    // glassy field with dozens.
+    void init_smooth()
+    {
+        directional::CartesianField power;
+        directional::power_field(
+            weaving_mesh_->tangent_bundle(),
+            Eigen::VectorXi(),
+            Eigen::MatrixXd(),
+            Eigen::VectorXd(),
+            1,
+            power);
+        directional::CartesianField raw;
+        directional::power_to_raw(power, 1, raw, /*normalize=*/false);
+
+        Eigen::MatrixXd int_field = raw.intField;
+        constexpr double length_floor = 1e-12;
+        for (int const face : std::views::iota(0, int_field.rows())) {
+            double const length = int_field.row(face).norm();
+            if (length < length_floor) {
+                int_field.row(face) << 1.0, 0.0;
+            } else {
+                int_field.row(face) /= length;
+            }
+        }
         field_.set_intrinsic_field(int_field);
         update_singularities();
     }
