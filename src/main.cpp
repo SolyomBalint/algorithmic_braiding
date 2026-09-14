@@ -98,12 +98,14 @@ std::string preset_path(DemoPreset const& preset)
 
 int selected_preset = 0;
 std::string custom_mesh_name;
+std::string last_mesh_path = preset_path(demo_presets[0]);
 char custom_mesh_path[1024] = "";
 std::unique_ptr<Session> session
     = std::make_unique<Session>(preset_path(demo_presets[0]));
 directional::DirectionalViewer viewer;
 polyscope::SurfaceFaceScalarQuantity* curl_quantity = nullptr;
 bool singularities_enabled = false;
+bool field_enabled = true;
 bool curl_enabled = false;
 bool streamlines_enabled = false;
 bool streamlines_ready = false;
@@ -119,6 +121,11 @@ int max_iterations = 50;
 double mu_scale = 1e-4; // μ start for Eq. (7), dimensionless (× total area)
 double mu_scale_max = 1.0; // continuation stops here
 double mu_theta = 0.01; // μ in Eq. (8), dimensionless (× mean face area)
+double s_prior_weight = 1.0; // κ in Eq. (8): pull s toward the rescaled s⁰
+// Stage 3 method: Eq. (7) eigenmode (paper) or the positive log-domain
+// integrating factor (for fields where Eq. (7) only has sign-changing modes).
+bool initial_scale_log = false;
+double mu_log = 0.01; // Dirichlet weight of the log solve
 double scale_multiplier = 1.0; // S in "s ← S·(π/ρ)·s"
 int scale_krylov_size = 80; // Lanczos steps for Eq. (7)
 int theta_power_iterations = 20; // θ-step inverse iteration
@@ -196,6 +203,7 @@ void reset_viewer()
     curl_quantity = nullptr;
     viewer.set_surface_mesh(session->weaving_mesh.mesh());
     viewer.set_cartesian_field(session->geodesic_field.field());
+    viewer.toggle_cartesian_field(field_enabled);
     viewer.toggle_singularities(singularities_enabled);
     curl_quantity = viewer.set_surface_face_data(
         session->geodesic_field.face_curl(), "curl");
@@ -209,6 +217,7 @@ void refresh_viewer()
 {
     session->geodesic_field.update_singularities();
     viewer.set_cartesian_field(session->geodesic_field.field());
+    viewer.toggle_cartesian_field(field_enabled);
     viewer.toggle_singularities(singularities_enabled);
     Eigen::VectorXd const curl = session->geodesic_field.face_curl();
     curl_quantity->updateData(curl);
@@ -271,13 +280,13 @@ bool try_load_mesh(std::string const& requested, int preset_index)
         return false;
     }
 
+    last_mesh_path = path;
     if (preset_index >= 0 && preset_index < demo_preset_count) {
         selected_preset = preset_index;
         apply_preset_params(demo_presets[preset_index]);
     } else {
         selected_preset = -1;
         custom_mesh_name = std::filesystem::path(path).filename().string();
-        // Unknown mesh: let the leaf density follow its edge lengths.
         auto_isoline_density = true;
     }
     return true;
@@ -287,6 +296,17 @@ void load_preset(int index)
 {
     DemoPreset const& preset = demo_presets[index];
     (void)try_load_mesh(preset_path(preset), index);
+}
+
+void reload_mesh()
+{
+    if (selected_preset >= 0) {
+        load_preset(selected_preset);
+        return;
+    }
+    if (!last_mesh_path.empty()) {
+        (void)try_load_mesh(last_mesh_path, -1);
+    }
 }
 
 std::vector<std::string> const& data_mesh_files()
@@ -397,10 +417,28 @@ void accept_initial_scale(InitialScaleResult const& result)
     show_scale();
 }
 
+void accept_log_scale(LogRescaleResult const& result)
+{
+    session->scale = result.s;
+    session->foliation.reset();
+    MeshTables const tables = mesh_tables(session->punctured->sub->mesh());
+    std::println(
+        "initial s (log integrating factor): μ {}, residual {:.3g}, skipped "
+        "edges {:.1f}%, s ∈ [{:.3g}, {:.3g}], low-|s| area {:.1f}%",
+        mu_log, result.residual, 100.0 * result.skipped_fraction,
+        result.s.minCoeff(), result.s.maxCoeff(),
+        100.0 * low_scale_area_fraction(tables.face_areas, result.s));
+    show_scale();
+}
+
 void run_initial_scale()
 {
     if (!session->punctured) {
         run_puncture();
+    }
+    if (initial_scale_log) {
+        accept_log_scale(log_integrating_factor(*session->punctured, mu_log));
+        return;
     }
     accept_initial_scale(
         initial_rescaling(*session->punctured, session->punctured_operators,
@@ -455,7 +493,8 @@ void run_alternate()
     if (session->scale.size() == 0) {
         run_rescale();
     }
-    FoliationSolver const solver(*session->punctured, mu_theta);
+    FoliationSolver solver(*session->punctured, mu_theta);
+    solver.prior_weight = s_prior_weight;
     session->foliation = solver.alternate(
         session->scale, alternations, theta_power_iterations);
     session->scale = session->foliation->s;
@@ -719,6 +758,15 @@ void tick_initial_s()
     job.plot_label = "rayleigh";
     job.mu = job.current_mu;
     job.lambda = 0.0;
+    if (initial_scale_log) {
+        accept_log_scale(log_integrating_factor(*session->punctured, mu_log));
+        if (job.recover_until == RecoverStage::InitialS) {
+            finish_job();
+            return;
+        }
+        job.recover_stage = RecoverStage::Rescale;
+        return;
+    }
     InitialScaleResult const result = initial_rescaling_at(*session->punctured,
         session->punctured_operators, job.current_mu, scale_krylov_size, 1e-10,
         0.02, max_localized_area, omega_floor, [](int step, int krylov) {
@@ -753,7 +801,8 @@ void tick_alternate()
     job.stage = "alternate";
     job.plot_label = "energy(8)";
     job.max_iter = alternations;
-    FoliationSolver const solver(*session->punctured, mu_theta);
+    FoliationSolver solver(*session->punctured, mu_theta);
+    solver.prior_weight = s_prior_weight;
     session->foliation
         = solver.alternate(session->scale, alternations, theta_power_iterations,
             [](int round, int total, Foliation const& foliation,
@@ -909,11 +958,9 @@ void callback()
             (void)try_load_mesh(custom_mesh_path, -1);
         }
     }
-    ImGui::InputDouble("lambda", &smoothness);
-    ImGui::InputDouble("lambda end", &lambda_end);
-    ImGui::InputDouble("shrink", &shrink);
-    ImGui::InputDouble("epsilon", &epsilon);
-    ImGui::InputInt("max iterations", &max_iterations);
+    if (ImGui::Button("reload")) {
+        reload_mesh();
+    }
     if (ImGui::Button("optimize")) {
         start_optimize();
     }
@@ -924,6 +971,10 @@ void callback()
     if (ImGui::Button("toggle singularities")) {
         singularities_enabled = !singularities_enabled;
         viewer.toggle_singularities(singularities_enabled);
+    }
+    if (ImGui::Button("toggle vector field")) {
+        field_enabled = !field_enabled;
+        viewer.toggle_cartesian_field(field_enabled);
     }
     ImGui::InputInt("streamline steps", &streamline_steps);
     ImGui::InputDouble("streamline spacing", &streamline_dist_ratio);
@@ -938,16 +989,6 @@ void callback()
 
     ImGui::Separator();
     ImGui::TextUnformatted("Foliation (theta from w)");
-    ImGui::InputDouble("mu s start (eq. 7)", &mu_scale, 0.0, 0.0, "%.1e");
-    ImGui::InputDouble("mu s max (eq. 7)", &mu_scale_max, 0.0, 0.0, "%.1e");
-    ImGui::InputDouble("mu theta (eq. 8)", &mu_theta, 0.0, 0.0, "%.1e");
-    ImGui::InputDouble("scale multiplier", &scale_multiplier);
-    ImGui::InputInt("s krylov size", &scale_krylov_size);
-    ImGui::InputInt("theta power iterations", &theta_power_iterations);
-    ImGui::InputInt("alternations", &alternations);
-    ImGui::InputDouble(
-        "max low-s area (eq. 7)", &max_localized_area, 0.0, 0.0, "%.2f");
-    ImGui::Checkbox("auto isolines per period", &auto_isoline_density);
     ImGui::InputDouble("leaf spacing (edges)", &leaf_spacing_edges);
     ImGui::BeginDisabled(auto_isoline_density);
     ImGui::InputInt("isolines per period", &isolines_per_period);
@@ -981,6 +1022,30 @@ void callback()
     }
     if (ImGui::Button("recover foliation (all)")) {
         start_recover(RecoverStage::Puncture, RecoverStage::Isolines);
+    }
+
+    if (ImGui::CollapsingHeader("advanced")) {
+        ImGui::InputDouble("lambda", &smoothness);
+        ImGui::InputDouble("lambda end", &lambda_end);
+        ImGui::InputDouble("shrink", &shrink);
+        ImGui::InputDouble("epsilon", &epsilon);
+        ImGui::InputInt("max iterations", &max_iterations);
+        ImGui::InputDouble("mu s start (eq. 7)", &mu_scale, 0.0, 0.0, "%.1e");
+        ImGui::InputDouble("mu s max (eq. 7)", &mu_scale_max, 0.0, 0.0, "%.1e");
+        ImGui::InputDouble("mu theta (eq. 8)", &mu_theta, 0.0, 0.0, "%.1e");
+        ImGui::InputDouble(
+            "s prior kappa (eq. 8)", &s_prior_weight, 0.0, 0.0, "%.1e");
+    ImGui::Checkbox("initial s: log integrating factor", &initial_scale_log);
+    ImGui::BeginDisabled(!initial_scale_log);
+    ImGui::InputDouble("mu log", &mu_log, 0.0, 0.0, "%.1e");
+    ImGui::EndDisabled();
+        ImGui::InputDouble("scale multiplier", &scale_multiplier);
+        ImGui::InputInt("s krylov size", &scale_krylov_size);
+        ImGui::InputInt("theta power iterations", &theta_power_iterations);
+        ImGui::InputInt("alternations", &alternations);
+        ImGui::InputDouble(
+            "max low-s area (eq. 7)", &max_localized_area, 0.0, 0.0, "%.2f");
+        ImGui::Checkbox("auto isolines per period", &auto_isoline_density);
     }
 
     ImGui::EndDisabled();

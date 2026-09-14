@@ -51,6 +51,16 @@ public:
     // rescale.
     bool linearize_at_zero = false;
 
+    // Prior on s in the s-step: (κ h²/2) ‖s − s⁰‖² with s⁰ the rescaled
+    // stage-4 field and κ dimensionless like μ. Eq. (8) alone lets s drift
+    // to zero wherever θ cannot follow the connection: the wrapped targets
+    // there look like noise, the least-squares s becomes ≈ 0, the next
+    // θ-step turns flat, and the leaves never come back (observed on
+    // Thingi10k meshes: |s| < 0.1·max on 70–90 % of the area after ten
+    // rounds, even from a strictly positive s⁰). κ = 0 is the paper's
+    // energy.
+    double prior_weight = 0.0;
+
     FoliationSolver(PuncturedMesh const& punctured, double mu)
         : punctured_(&punctured)
     {
@@ -182,10 +192,12 @@ public:
     // linearized about the current s⁰ (wrap is the identity on its branch):
     //   r ≈ t − s_f d,   t = s⁰_f d + wrap(θ_β − θ_α − s⁰_f d),
     // giving the SPD system ( diag_f Σ ω d² + μ Q_s ) s = b,  b_f = Σ ω d t.
-    void s_step(Eigen::VectorXd const& theta, Eigen::VectorXd& s) const
+    void s_step(Eigen::VectorXd const& theta, Eigen::VectorXd& s,
+        Eigen::VectorXd const& prior = Eigen::VectorXd()) const
     {
         MeshTables const tables = mesh_tables(punctured_->sub->mesh());
         int const face_count = tables.faces.rows();
+        double const kappa = prior_weight * tables.face_areas.mean();
 
         Eigen::VectorXd diagonal = Eigen::VectorXd::Zero(face_count);
         Eigen::VectorXd rhs = Eigen::VectorXd::Zero(face_count);
@@ -204,8 +216,13 @@ public:
         }
 
         Eigen::SparseMatrix<double> system = mu_ * scalar_laplacian_;
+        bool const use_prior = kappa > 0.0 && prior.size() == face_count;
         for (int const face : std::views::iota(0, face_count)) {
             system.coeffRef(face, face) += diagonal(face);
+            if (use_prior) {
+                system.coeffRef(face, face) += kappa;
+                rhs(face) += kappa * prior(face);
+            }
         }
         system.makeCompressed();
         Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver(system);
@@ -244,6 +261,7 @@ public:
     {
         Foliation foliation;
         foliation.s = std::move(s);
+        Eigen::VectorXd const prior = foliation.s;
         Eigen::VectorXd previous_theta;
         for (int const round : std::views::iota(1, alternations + 1)) {
             double const rayleigh
@@ -278,7 +296,7 @@ public:
                 break;
             }
             Eigen::VectorXd const before = foliation.s;
-            s_step(foliation.theta, foliation.s);
+            s_step(foliation.theta, foliation.s, prior);
             std::println("alternation {}: ‖Δs‖ {}  energy(8) {}", round,
                 (foliation.s - before).norm(),
                 energy(foliation.theta, foliation.s));

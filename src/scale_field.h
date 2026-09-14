@@ -408,6 +408,111 @@ inline InitialScaleResult initial_rescaling(
     return result;
 }
 
+struct LogRescaleResult {
+    Eigen::VectorXd s; // strictly positive, ‖s‖_M normalized to 1
+    double residual = 0.0; // weighted ‖x_l − x_r − t‖ / ‖t‖ over used edges
+    double skipped_fraction = 0.0; // edges with p_l p_r ≤ 0 (no information)
+};
+
+// Alternative to Eq. (7): a rescaling that is positive by construction.
+// Closedness of s ŵ⊥ across an interior edge e = (l, r) is
+//     s_l p_l = s_r p_r,   p_f = ŵ⊥_f · e,
+// which in x = log s is the linear condition x_l − x_r = log(p_r / p_l)
+// whenever p_l p_r > 0. Weighted least squares over those edges (weight
+// |p_l p_r| / |e|², so edges nearly parallel to ŵ count little) plus
+// μ xᵀ Q_s x on the dual graph gives one SPD solve. Edges with p_l p_r ≤ 0
+// carry no information and are skipped.
+//
+// Eq. (7) finds the optimal rescaling but is free to change sign; on fields
+// without a global positive integrating factor (Thingi10k meshes) every
+// mode below the trivial eigenvalue 1 does, and the Eq. (8) alternation
+// then collapses s. This solve always returns a positive s that can be
+// held with the s-prior of FoliationSolver. Its weakness: where the
+// informative edges are exactly the skipped ones (Directional's torus:
+// the quad diagonals) it degenerates to a constant s, while Eq. (7) does
+// not, so it is not the default.
+inline LogRescaleResult log_integrating_factor(
+    PuncturedMesh const& punctured,
+    double mu,
+    double scalar_weight_floor = omega_floor)
+{
+    MeshTables const tables = mesh_tables(punctured.sub->mesh());
+    Eigen::MatrixXd const perp = perpendicular_ambient(punctured);
+    int const face_count = tables.faces.rows();
+    int const interior_count = static_cast<int>(tables.interior_edges.size());
+
+    struct Term {
+        int left;
+        int right;
+        double weight;
+        double target;
+    };
+    std::vector<Term> terms;
+    std::vector<Eigen::Triplet<double>> entries;
+    Eigen::VectorXd rhs = Eigen::VectorXd::Zero(face_count);
+    int skipped = 0;
+    for (int const interior : std::views::iota(0, interior_count)) {
+        int const edge = tables.interior_edges(interior);
+        int const left = tables.edge_faces(edge, 0);
+        int const right = tables.edge_faces(edge, 1);
+        Eigen::RowVector3d const edge_vector =
+            tables.vertex_positions.row(tables.edge_vertices(edge, 1))
+            - tables.vertex_positions.row(tables.edge_vertices(edge, 0));
+        double const p_left = perp.row(left).dot(edge_vector);
+        double const p_right = perp.row(right).dot(edge_vector);
+        double const length2 = edge_vector.squaredNorm();
+        if (p_left * p_right <= 1e-6 * length2) {
+            ++skipped;
+            continue;
+        }
+        double const weight = std::abs(p_left * p_right) / length2;
+        double const target = std::log(p_right / p_left);
+        terms.push_back({ left, right, weight, target });
+        entries.emplace_back(left, left, weight);
+        entries.emplace_back(right, right, weight);
+        entries.emplace_back(left, right, -weight);
+        entries.emplace_back(right, left, -weight);
+        rhs(left) += weight * target;
+        rhs(right) -= weight * target;
+    }
+
+    Eigen::SparseMatrix<double> system(face_count, face_count);
+    system.setFromTriplets(entries.begin(), entries.end());
+    system = system + mu * face_scalar_laplacian(tables, scalar_weight_floor);
+    // Pin the constant (log s is defined up to an additive constant).
+    double const shift = 1e-10 * system.diagonal().sum() / face_count;
+    for (int const face : std::views::iota(0, face_count)) {
+        system.coeffRef(face, face) += shift;
+    }
+    system.makeCompressed();
+    Eigen::SimplicialLDLT<Eigen::SparseMatrix<double>> solver(system);
+    if (solver.info() != Eigen::Success) {
+        throw std::runtime_error("log_integrating_factor: LDLT failed");
+    }
+    Eigen::VectorXd x = solver.solve(rhs);
+    x.array() -= x.mean();
+
+    LogRescaleResult result;
+    double numerator = 0.0;
+    double denominator = 0.0;
+    for (Term const& term : terms) {
+        double const defect = x(term.left) - x(term.right) - term.target;
+        numerator += term.weight * defect * defect;
+        denominator += term.weight * term.target * term.target;
+    }
+    result.residual = denominator > 0.0 ? std::sqrt(numerator / denominator)
+                                        : 0.0;
+    result.skipped_fraction = interior_count > 0
+        ? static_cast<double>(skipped) / interior_count
+        : 0.0;
+    result.s = x.array().exp();
+    double const norm = std::sqrt(
+        result.s.dot(tables.face_areas.cwiseProduct(result.s))
+        / tables.face_areas.sum());
+    result.s /= norm;
+    return result;
+}
+
 // §4.2.4, footnote 4: the phase change |s ŵ⊥ · e| over every interior edge,
 // seen from both incident faces (2·|E_int| values, edge-major).
 inline Eigen::VectorXd edge_phases(
