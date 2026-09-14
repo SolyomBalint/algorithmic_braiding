@@ -13,6 +13,7 @@
 #include <cfloat>
 #include <chrono>
 #include <exception>
+#include <filesystem>
 #include <iterator>
 #include <memory>
 #include <optional>
@@ -90,6 +91,8 @@ std::string preset_path(DemoPreset const& preset)
 }
 
 int selected_preset = 0;
+std::string custom_mesh_name;
+char custom_mesh_path[1024] = "";
 std::unique_ptr<Session> session
     = std::make_unique<Session>(preset_path(demo_presets[0]));
 directional::DirectionalViewer viewer;
@@ -116,7 +119,7 @@ int theta_power_iterations = 20; // θ-step inverse iteration
 int alternations = 10; // θ/s rounds
 int isolines_per_period = 4;
 
-void apply_preset(DemoPreset const& preset)
+void apply_preset_params(DemoPreset const& preset)
 {
     smoothness = preset.lambda_start;
     lambda_end = preset.lambda_end;
@@ -126,7 +129,11 @@ void apply_preset(DemoPreset const& preset)
     mu_scale = preset.mu_scale;
     mu_theta = preset.mu_theta;
     isolines_per_period = preset.isolines_per_period;
-    // Deterministic smooth start (Knöppel-style field) for both meshes.
+}
+
+void apply_preset(DemoPreset const& preset)
+{
+    apply_preset_params(preset);
     session->geodesic_field.init_smooth();
 }
 
@@ -194,19 +201,103 @@ void refresh_viewer()
     }
 }
 
+std::string resolve_mesh_path(std::string const& requested)
+{
+    if (requested.empty()) {
+        throw std::runtime_error("empty mesh path");
+    }
+    std::filesystem::path const path(requested);
+    if (std::filesystem::is_regular_file(path)) {
+        return std::filesystem::weakly_canonical(path).string();
+    }
+    std::filesystem::path const in_data
+        = std::filesystem::path(DIRECTIONAL_DATA_PATH) / path;
+    if (std::filesystem::is_regular_file(in_data)) {
+        return std::filesystem::weakly_canonical(in_data).string();
+    }
+    std::filesystem::path const in_data_name
+        = std::filesystem::path(DIRECTIONAL_DATA_PATH) / path.filename();
+    if (std::filesystem::is_regular_file(in_data_name)) {
+        return std::filesystem::weakly_canonical(in_data_name).string();
+    }
+    throw std::runtime_error("file not found: " + requested);
+}
+
+bool try_load_mesh(std::string const& requested, int preset_index)
+{
+    std::string path;
+    std::unique_ptr<Session> next;
+    try {
+        path = resolve_mesh_path(requested);
+        next = std::make_unique<Session>(path);
+        next->geodesic_field.init_smooth();
+    } catch (std::exception const& error) {
+        std::println("failed to load {}: {}", requested, error.what());
+        return false;
+    }
+
+    std::unique_ptr<Session> previous = std::move(session);
+    session = std::move(next);
+    try {
+        reset_viewer();
+    } catch (std::exception const& error) {
+        std::println("failed to display {}: {}", path, error.what());
+        session = std::move(previous);
+        try {
+            reset_viewer();
+        } catch (std::exception const& restore_error) {
+            std::println(
+                "failed to restore previous mesh: {}", restore_error.what());
+        }
+        return false;
+    }
+
+    if (preset_index >= 0 && preset_index < demo_preset_count) {
+        selected_preset = preset_index;
+        apply_preset_params(demo_presets[preset_index]);
+    } else {
+        selected_preset = -1;
+        custom_mesh_name = std::filesystem::path(path).filename().string();
+    }
+    return true;
+}
+
 void load_preset(int index)
 {
     DemoPreset const& preset = demo_presets[index];
-    std::string const path = preset_path(preset);
-    try {
-        session = std::make_unique<Session>(path);
-    } catch (std::exception const& error) {
-        std::println("failed to load {}: {}", path, error.what());
-        return;
+    (void)try_load_mesh(preset_path(preset), index);
+}
+
+std::vector<std::string> const& data_mesh_files()
+{
+    static std::vector<std::string> files;
+    static bool scanned = false;
+    if (scanned) {
+        return files;
     }
-    selected_preset = index;
-    apply_preset(preset);
-    reset_viewer();
+    scanned = true;
+    try {
+        for (std::filesystem::directory_entry const& entry :
+            std::filesystem::directory_iterator(DIRECTIONAL_DATA_PATH)) {
+            try {
+                if (!entry.is_regular_file()) {
+                    continue;
+                }
+            } catch (std::exception const&) {
+                continue;
+            }
+            std::string const name = entry.path().filename().string();
+            std::string const ext = mesh_extension(name);
+            if (ext == ".obj" || ext == ".off") {
+                files.push_back(name);
+            }
+        }
+        std::ranges::sort(files);
+    } catch (std::exception const& error) {
+        std::println(
+            "cannot list {}: {}", DIRECTIONAL_DATA_PATH, error.what());
+    }
+    return files;
 }
 
 // Scatter a punctured-face quantity back onto the original faces (0 on
@@ -665,7 +756,10 @@ void callback()
     bool const busy = job.kind != JobKind::Idle;
     ImGui::BeginDisabled(busy);
 
-    if (ImGui::BeginCombo("mesh", demo_presets[selected_preset].label)) {
+    char const* const mesh_label = selected_preset >= 0
+        ? demo_presets[selected_preset].label
+        : (custom_mesh_name.empty() ? "custom" : custom_mesh_name.c_str());
+    if (ImGui::BeginCombo("mesh", mesh_label)) {
         for (int const i : std::views::iota(0, demo_preset_count)) {
             bool const selected = i == selected_preset;
             if (ImGui::Selectable(demo_presets[i].label, selected)
@@ -676,7 +770,25 @@ void callback()
                 ImGui::SetItemDefaultFocus();
             }
         }
+        ImGui::Separator();
+        for (std::string const& name : data_mesh_files()) {
+            if (name == "torus.obj" || name == "fertility.obj") {
+                continue;
+            }
+            bool const selected
+                = selected_preset < 0 && custom_mesh_name == name;
+            if (ImGui::Selectable(name.c_str(), selected)) {
+                (void)try_load_mesh(
+                    std::string(DIRECTIONAL_DATA_PATH) + "/" + name, -1);
+            }
+        }
         ImGui::EndCombo();
+    }
+    if (ImGui::CollapsingHeader("load mesh")) {
+        ImGui::InputText("path", custom_mesh_path, sizeof custom_mesh_path);
+        if (ImGui::Button("load path")) {
+            (void)try_load_mesh(custom_mesh_path, -1);
+        }
     }
     ImGui::InputDouble("lambda", &smoothness);
     ImGui::InputDouble("lambda end", &lambda_end);
