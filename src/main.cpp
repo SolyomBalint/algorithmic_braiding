@@ -59,6 +59,8 @@ struct DemoPreset {
     double mu_scale; // Eq. (7) continuation start (× total area)
     double mu_theta; // Eq. (8), × mean face area
     int isolines_per_period;
+    bool auto_isoline_density; // derive isolines_per_period from the mesh
+    double leaf_spacing_edges; // target leaf spacing, in median-phase edges
 };
 
 constexpr DemoPreset demo_presets[] = {
@@ -71,7 +73,9 @@ constexpr DemoPreset demo_presets[] = {
         .max_iterations = 50,
         .mu_scale = 1e-4,
         .mu_theta = 0.01,
-        .isolines_per_period = 4 },
+        .isolines_per_period = 4,
+        .auto_isoline_density = false,
+        .leaf_spacing_edges = 5.0 },
     { .label = "fertility",
         .filename = "fertility.obj",
         .lambda_start = 100.0,
@@ -81,7 +85,9 @@ constexpr DemoPreset demo_presets[] = {
         .max_iterations = 10,
         .mu_scale = 1e-4,
         .mu_theta = 0.01,
-        .isolines_per_period = 4 },
+        .isolines_per_period = 4,
+        .auto_isoline_density = false,
+        .leaf_spacing_edges = 5.0 },
 };
 constexpr int demo_preset_count = static_cast<int>(std::size(demo_presets));
 
@@ -118,6 +124,14 @@ int scale_krylov_size = 80; // Lanczos steps for Eq. (7)
 int theta_power_iterations = 20; // θ-step inverse iteration
 int alternations = 10; // θ/s rounds
 int isolines_per_period = 4;
+// Leaf density: with the paper's rescale the *largest* edge phase is π, so on
+// meshes with a wide edge-length spread a fixed count per period gives leaves
+// dozens of edges apart. `auto` derives the count from the median edge phase
+// so leaves are ~`leaf_spacing_edges` typical edges apart.
+bool auto_isoline_density = true;
+double leaf_spacing_edges = 5.0;
+double max_localized_area = 0.5; // Eq. (7) mode rejection: low-|s| area
+bool leaf_shading = false; // shader contours instead of the curve network
 
 void apply_preset_params(DemoPreset const& preset)
 {
@@ -129,6 +143,8 @@ void apply_preset_params(DemoPreset const& preset)
     mu_scale = preset.mu_scale;
     mu_theta = preset.mu_theta;
     isolines_per_period = preset.isolines_per_period;
+    auto_isoline_density = preset.auto_isoline_density;
+    leaf_spacing_edges = preset.leaf_spacing_edges;
 }
 
 void apply_preset(DemoPreset const& preset)
@@ -138,7 +154,10 @@ void apply_preset(DemoPreset const& preset)
 }
 
 constexpr char const* isolines_name = "Isolines";
+constexpr char const* leaf_shading_name = "leaves (theta unwrapped)";
 constexpr char const* punctured_faces_name = "punctured faces";
+constexpr char const* aliased_faces_name = "aliased faces";
+constexpr char const* surface_mesh_name = "Mesh 0"; // DirectionalViewer's
 constexpr char const* streamlines_name = "Streamlines 0";
 
 void clear_streamlines()
@@ -258,6 +277,8 @@ bool try_load_mesh(std::string const& requested, int preset_index)
     } else {
         selected_preset = -1;
         custom_mesh_name = std::filesystem::path(path).filename().string();
+        // Unknown mesh: let the leaf density follow its edge lengths.
+        auto_isoline_density = true;
     }
     return true;
 }
@@ -343,6 +364,10 @@ void run_puncture()
     session->scale.resize(0);
     session->foliation.reset();
     polyscope::removeStructure(isolines_name, false);
+    polyscope::getSurfaceMesh(surface_mesh_name)
+        ->removeQuantity(leaf_shading_name, false);
+    polyscope::getSurfaceMesh(surface_mesh_name)
+        ->removeQuantity(aliased_faces_name, false);
     std::println(
         "puncture: {} singular vertices, {} faces deleted, {} faces / {} "
         "vertices remain",
@@ -358,11 +383,13 @@ void accept_initial_scale(InitialScaleResult const& result)
     session->foliation.reset();
     std::println(
         "initial s: μ {} ({}), {} Lanczos steps, lowest eigenvalues {}, "
-        "negative-area fractions {}, chose mode {}",
+        "negative-area fractions {}, low-|s| area fractions {}, chose mode {}",
         result.mu,
-        result.sign_consistent ? "sign-consistent" : "NO sign-consistent mode",
+        result.accepted ? "accepted"
+                        : "NO sign-consistent, non-localized mode",
         result.iterations, result.lowest_eigenvalues.transpose(),
-        result.negative_area_fractions.transpose(), result.chosen_mode);
+        result.negative_area_fractions.transpose(),
+        result.low_scale_area_fractions.transpose(), result.chosen_mode);
     std::println(
         "initial s: rayleigh {}, ‖δ‖_M {}, ‖C(sŵ⊥+δ)‖ {}, s ∈ [{}, {}]",
         result.rayleigh_quotient, result.residual_norm, result.constraint_norm,
@@ -377,7 +404,8 @@ void run_initial_scale()
     }
     accept_initial_scale(
         initial_rescaling(*session->punctured, session->punctured_operators,
-            mu_scale, mu_scale_max, scale_krylov_size, 1e-10));
+            mu_scale, mu_scale_max, scale_krylov_size, 1e-10, 0.02,
+            max_localized_area));
 }
 
 void run_rescale()
@@ -408,6 +436,17 @@ void show_foliation()
     theta_quantity->setEnabled(true);
     viewer.set_surface_face_data(
         faces_to_original(diagnostics.alignment), "alignment error");
+    // Faces the isoline extractor will skip (θ winds inside them): kept as
+    // a disabled colour quantity so gaps in the leaves can be explained.
+    Eigen::VectorXi aliased(diagnostics.aliased_count);
+    int next = 0;
+    for (int const face :
+        std::views::iota(0, static_cast<int>(diagnostics.aliased.size()))) {
+        if (diagnostics.aliased(face)) {
+            aliased(next++) = session->punctured->face_to_original(face);
+        }
+    }
+    viewer.highlight_faces(aliased, aliased_faces_name)->setEnabled(false);
     show_scale();
 }
 
@@ -423,22 +462,102 @@ void run_alternate()
     show_foliation();
 }
 
+// Shader-side leaves: a corner scalar quantity holding the per-face
+// unwrapped θ (see unwrapped_corner_theta) with Polyscope's isoline
+// contouring at period `spacing`. Screen-space line width, so the leaves
+// stay visible at any zoom and mesh scale, and no ±π seam.
+void show_leaf_shading(double spacing)
+{
+    PuncturedMesh const& punctured = *session->punctured;
+    Eigen::MatrixXi const& sub_faces = punctured.sub->mesh().F;
+    Eigen::VectorXd const sub_corners = unwrapped_corner_theta(
+        sub_faces, session->foliation->theta, spacing);
+    Eigen::VectorXd corners
+        = Eigen::VectorXd::Zero(3 * session->weaving_mesh.mesh().F.rows());
+    for (int const face :
+        std::views::iota(0, static_cast<int>(sub_faces.rows()))) {
+        corners.segment<3>(3 * punctured.face_to_original(face))
+            = sub_corners.segment<3>(3 * face);
+    }
+    polyscope::SurfaceCornerScalarQuantity* quantity
+        = polyscope::getSurfaceMesh(surface_mesh_name)
+              ->addCornerScalarQuantity(leaf_shading_name, corners);
+    // A huge map range gives a uniform base colour; only the contours show.
+    quantity->setColorMap("blues");
+    quantity->setMapRange({ -1e6, 1e6 });
+    quantity->setIsolinesEnabled(true);
+    quantity->setIsolineStyle(polyscope::IsolineStyle::Contour);
+    quantity->setIsolinePeriod(spacing, false);
+    quantity->setIsolineContourThickness(0.15);
+    quantity->setIsolineDarkness(0.9); // line strength, 1 = black
+    quantity->setEnabled(leaf_shading);
+}
+
 void run_isolines()
 {
     if (!session->foliation) {
         run_alternate();
     }
-    IsolineCurves const curves
-        = periodic_isolines(session->punctured->sub->mesh(),
-            session->foliation->theta, isolines_per_period);
-    std::println("isolines: {} segments", curves.edges.rows());
+    PuncturedMesh const& punctured = *session->punctured;
+    Foliation const& foliation = *session->foliation;
+
+    if (auto_isoline_density) {
+        isolines_per_period = auto_isolines_per_period(
+            punctured, foliation.s, leaf_spacing_edges);
+    }
+    isolines_per_period = std::max(1, isolines_per_period);
+    double const spacing = 2.0 * std::numbers::pi / isolines_per_period;
+
+    // Which of the three "few leaves" causes applies: edge phases near π
+    // everywhere means the mesh is at the aliasing bound (raise the count),
+    // a small median against the max means a wide edge-length or s spread,
+    // a large low-|s| area means Eq. (7) returned a localized mode.
+    Eigen::VectorXd const phases = edge_phases(punctured, foliation.s);
+    MeshTables const tables = mesh_tables(punctured.sub->mesh());
+    std::println(
+        "isolines: edge phase p50 {:.3g}, p90 {:.3g}, max {:.3g} (π = {:.3g}); "
+        "low-|s| area {:.1f}%; {} levels per period ({})",
+        quantile(phases, 0.5), quantile(phases, 0.9),
+        phases.size() > 0 ? phases.maxCoeff() : 0.0, std::numbers::pi,
+        100.0 * low_scale_area_fraction(tables.face_areas, foliation.s),
+        isolines_per_period, auto_isoline_density ? "auto" : "manual");
+
+    IsolineCurves const curves = periodic_isolines(
+        punctured.sub->mesh(), foliation.theta, isolines_per_period);
+    Eigen::VectorXi per_level = Eigen::VectorXi::Zero(isolines_per_period);
+    for (int const i :
+        std::views::iota(0, static_cast<int>(curves.level.size()))) {
+        ++per_level(curves.level(i));
+    }
+    std::println("isolines: {} segments, per level min {} max {}",
+        curves.edges.rows(), per_level.minCoeff(), per_level.maxCoeff());
+
     polyscope::removeStructure(isolines_name, false);
     polyscope::CurveNetwork* network = polyscope::registerCurveNetwork(
         isolines_name, curves.nodes, curves.edges);
-    network->setRadius(
-        0.05 * session->weaving_mesh.mesh().avgEdgeLength, false);
+    // Relative radius: a fraction of the scene scale rather than of the
+    // average edge, which is sub-pixel on large, finely meshed models.
+    network->setRadius(0.0015, true);
+    network->setMaterial("flat");
     network->addEdgeScalarQuantity("level", curves.level.cast<double>())
+        ->setColorMap("turbo")
         ->setEnabled(true);
+    network->setEnabled(!leaf_shading);
+    show_leaf_shading(spacing);
+}
+
+void toggle_leaf_shading()
+{
+    leaf_shading = !leaf_shading;
+    if (polyscope::hasCurveNetwork(isolines_name)) {
+        polyscope::getCurveNetwork(isolines_name)->setEnabled(!leaf_shading);
+    }
+    polyscope::Quantity* quantity
+        = polyscope::getSurfaceMesh(surface_mesh_name)
+              ->getQuantity(leaf_shading_name);
+    if (quantity != nullptr) {
+        quantity->setEnabled(leaf_shading);
+    }
 }
 
 template <typename Step>
@@ -602,7 +721,7 @@ void tick_initial_s()
     job.lambda = 0.0;
     InitialScaleResult const result = initial_rescaling_at(*session->punctured,
         session->punctured_operators, job.current_mu, scale_krylov_size, 1e-10,
-        0.02, omega_floor, [](int step, int krylov) {
+        0.02, max_localized_area, omega_floor, [](int step, int krylov) {
             if (job.cancel) {
                 throw JobCancelled {};
             }
@@ -612,7 +731,7 @@ void tick_initial_s()
         });
     accept_initial_scale(result);
     append_plot(result.rayleigh_quotient);
-    bool const done_mu = result.sign_consistent
+    bool const done_mu = result.accepted
         || job.current_mu >= mu_scale_max * (1.0 + 1e-12);
     if (!done_mu) {
         job.current_mu *= 10.0;
@@ -826,7 +945,17 @@ void callback()
     ImGui::InputInt("s krylov size", &scale_krylov_size);
     ImGui::InputInt("theta power iterations", &theta_power_iterations);
     ImGui::InputInt("alternations", &alternations);
+    ImGui::InputDouble(
+        "max low-s area (eq. 7)", &max_localized_area, 0.0, 0.0, "%.2f");
+    ImGui::Checkbox("auto isolines per period", &auto_isoline_density);
+    ImGui::InputDouble("leaf spacing (edges)", &leaf_spacing_edges);
+    ImGui::BeginDisabled(auto_isoline_density);
     ImGui::InputInt("isolines per period", &isolines_per_period);
+    ImGui::EndDisabled();
+    if (ImGui::Button(leaf_shading ? "leaves: shader contours (toggle)"
+                                   : "leaves: curve network (toggle)")) {
+        toggle_leaf_shading();
+    }
     if (ImGui::Button("puncture")) {
         guarded("puncture", run_puncture);
     }

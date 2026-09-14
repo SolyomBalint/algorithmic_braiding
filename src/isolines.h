@@ -89,3 +89,33 @@ inline IsolineCurves periodic_isolines(
     }
     return curves;
 }
+
+// Per-corner θ for shader-side contouring (Polyscope corner scalar
+// quantity + isolines): each face's corners are unwrapped relative to corner
+// 0 and shifted by π + spacing/2, so the levels c_{k,m} above sit exactly
+// where Polyscope's contour rule draws, fract(value / spacing) = ½, without
+// the ±π seam a vertex quantity would show. Values are ≥ 0 (the rule uses
+// |value|). Corner i of face f is entry 3f + i. Aliased faces get the
+// constant 0: fract = 0, no contour, and a finite shader gradient term.
+//
+// Stripe shading (alternate bands of width `spacing`) is only seam-free
+// when 2π is a multiple of 2·spacing, i.e. for an even number of lines per
+// period; contours are fine for any count.
+inline Eigen::VectorXd unwrapped_corner_theta(
+    Eigen::MatrixXi const& faces,
+    Eigen::VectorXd const& theta,
+    double spacing)
+{
+    int const face_count = faces.rows();
+    double const offset = std::numbers::pi + 0.5 * spacing;
+    Eigen::VectorXd corners = Eigen::VectorXd::Zero(3 * face_count);
+    for (int const face : std::views::iota(0, face_count)) {
+        Eigen::Vector3d values;
+        if (unwrap_face(theta, faces, face, values)) {
+            for (int const corner : std::views::iota(0, 3)) {
+                corners(3 * face + corner) = values(corner) + offset;
+            }
+        }
+    }
+    return corners;
+}

@@ -7,6 +7,7 @@
 #include <Eigen/Sparse>
 #include <Eigen/SparseCholesky>
 
+#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <numbers>
@@ -142,14 +143,33 @@ inline ScaleSystem assemble_scale_system(
     return system;
 }
 
+// Fraction of the surface where |s| is below `ratio` × max |s|: a rescaling
+// that is (nearly) zero on most of the surface gives θ no leaves there.
+inline double low_scale_area_fraction(
+    Eigen::VectorXd const& face_areas,
+    Eigen::VectorXd const& s,
+    double ratio = 0.1)
+{
+    double const threshold = ratio * s.cwiseAbs().maxCoeff();
+    double low = 0.0;
+    for (int const face : std::views::iota(0, static_cast<int>(s.size()))) {
+        if (std::abs(s(face)) < threshold) {
+            low += face_areas(face);
+        }
+    }
+    return low / face_areas.sum();
+}
+
 struct InitialScaleResult {
     Eigen::VectorXd s;
     double rayleigh_quotient = 0.0;
     Eigen::VectorXd lowest_eigenvalues; // a few Ritz values, ascending
     Eigen::VectorXd negative_area_fractions; // per Ritz mode, same order
-    int chosen_mode = 0; // index into the two vectors above
+    Eigen::VectorXd low_scale_area_fractions; // per Ritz mode, same order
+    int chosen_mode = 0; // index into the vectors above
     double negative_area_fraction = 0.0; // of the chosen s
-    bool sign_consistent = false; // chosen mode passed the sign test
+    double low_scale_area_fraction = 0.0; // of the chosen s
+    bool accepted = false; // chosen mode passed the sign and localization tests
     double mu = 0.0; // μ the result was computed with
     double residual_norm = 0.0; // ‖δ‖_M
     double constraint_norm = 0.0; // ‖B x‖ = ‖C(s ŵ⊥ + δ)‖
@@ -179,8 +199,11 @@ struct InitialScaleResult {
 // singularities its lowest mode is often a sign-changing one (θ ≈ sin 2λ
 // around a pole instead of θ = λ: same leaves, but bunched and with a
 // critical set). We therefore take the lowest Ritz mode whose s has at
-// most `max_negative_area` of the area negative (after the sign flip),
-// falling back to the lowest mode when none qualifies.
+// most `max_negative_area` of the area negative (after the sign flip) and
+// whose |s| is not tiny (below 10% of its maximum) on more than
+// `max_localized_area` of the surface — a localized bump would leave θ
+// without leaves everywhere else — falling back to the lowest mode when none
+// qualifies.
 inline InitialScaleResult initial_rescaling_at(
     PuncturedMesh const& punctured,
     FaceFieldOperators const& operators,
@@ -188,6 +211,7 @@ inline InitialScaleResult initial_rescaling_at(
     int krylov_size,
     double tolerance,
     double max_negative_area = 0.02,
+    double max_localized_area = 0.5,
     double scalar_weight_floor = omega_floor,
     std::function<void(int, int)> const& on_step = {})
 {
@@ -311,26 +335,32 @@ inline InitialScaleResult initial_rescaling_at(
     int const candidates = std::min(steps, 8);
     result.lowest_eigenvalues.resize(candidates);
     result.negative_area_fractions.resize(candidates);
+    result.low_scale_area_fractions.resize(candidates);
     std::vector<Eigen::VectorXd> vectors;
     for (int const k : std::views::iota(0, candidates)) {
         result.lowest_eigenvalues(k) =
             1.0 / ritz.eigenvalues()(steps - 1 - k) - shift;
         vectors.push_back(ritz_vector(k));
         result.negative_area_fractions(k) = negative_area(vectors[k]);
+        result.low_scale_area_fractions(k) = low_scale_area_fraction(
+            tables.face_areas, vectors[k].tail(face_count));
     }
     result.mu = mu;
     result.chosen_mode = 0;
-    result.sign_consistent = false;
+    result.accepted = false;
     for (int const k : std::views::iota(0, candidates)) {
-        if (result.negative_area_fractions(k) <= max_negative_area) {
+        if (result.negative_area_fractions(k) <= max_negative_area
+            && result.low_scale_area_fractions(k) <= max_localized_area) {
             result.chosen_mode = k;
-            result.sign_consistent = true;
+            result.accepted = true;
             break;
         }
     }
     Eigen::VectorXd const& x = vectors[result.chosen_mode];
     result.negative_area_fraction =
         result.negative_area_fractions(result.chosen_mode);
+    result.low_scale_area_fraction =
+        result.low_scale_area_fractions(result.chosen_mode);
     result.rayleigh_quotient = x.dot(energy * x) / x.dot(norm * x);
 
     Eigen::VectorXd const delta = x.head(stacked_size);
@@ -355,6 +385,7 @@ inline InitialScaleResult initial_rescaling(
     int krylov_size,
     double tolerance,
     double max_negative_area = 0.02,
+    double max_localized_area = 0.5,
     double scalar_weight_floor = omega_floor,
     std::function<void(int, int)> const& on_step = {})
 {
@@ -367,36 +398,80 @@ inline InitialScaleResult initial_rescaling(
             krylov_size,
             tolerance,
             max_negative_area,
+            max_localized_area,
             scalar_weight_floor,
             on_step);
-        if (result.sign_consistent) {
+        if (result.accepted) {
             break;
         }
     }
     return result;
 }
 
-// §4.2.4, footnote 4: the largest phase change s ŵ⊥ · e over any edge.
-inline double max_edge_phase(
+// §4.2.4, footnote 4: the phase change |s ŵ⊥ · e| over every interior edge,
+// seen from both incident faces (2·|E_int| values, edge-major).
+inline Eigen::VectorXd edge_phases(
     PuncturedMesh const& punctured,
     Eigen::VectorXd const& s)
 {
     MeshTables const tables = mesh_tables(punctured.sub->mesh());
     Eigen::MatrixXd const perp = perpendicular_ambient(punctured);
-    double rho = 0.0;
-    for (int const interior :
-        std::views::iota(0, static_cast<int>(tables.interior_edges.size()))) {
+    int const interior_count = static_cast<int>(tables.interior_edges.size());
+    Eigen::VectorXd phases(2 * interior_count);
+    for (int const interior : std::views::iota(0, interior_count)) {
         int const edge = tables.interior_edges(interior);
         Eigen::RowVector3d const edge_vector =
             tables.vertex_positions.row(tables.edge_vertices(edge, 1))
             - tables.vertex_positions.row(tables.edge_vertices(edge, 0));
         for (int const side : std::views::iota(0, 2)) {
             int const face = tables.edge_faces(edge, side);
-            rho = std::max(
-                rho, std::abs(s(face) * perp.row(face).dot(edge_vector)));
+            phases(2 * interior + side) =
+                std::abs(s(face) * perp.row(face).dot(edge_vector));
         }
     }
-    return rho;
+    return phases;
+}
+
+// The largest phase change over any edge (ρ of footnote 4).
+inline double max_edge_phase(
+    PuncturedMesh const& punctured,
+    Eigen::VectorXd const& s)
+{
+    Eigen::VectorXd const phases = edge_phases(punctured, s);
+    return phases.size() > 0 ? phases.maxCoeff() : 0.0;
+}
+
+// q-th quantile (q ∈ [0, 1]) of a set of values; 0 when empty.
+inline double quantile(Eigen::VectorXd values, double q)
+{
+    if (values.size() == 0) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    int const index = std::clamp(
+        static_cast<int>(q * static_cast<double>(values.size() - 1)),
+        0, static_cast<int>(values.size()) - 1);
+    return values(index);
+}
+
+// Leaf density from the mesh rather than from the worst edge: with the
+// rescale above the *largest* edge phase is π, so on meshes whose edge
+// lengths vary a lot (or whose s does) the typical edge advances θ by a small
+// fraction of π and a fixed number of leaves per period spreads them far
+// apart. Choose the number of levels per period so that neighbouring leaves
+// are about `leaf_spacing_edges` typical (median-phase) edges apart.
+inline int auto_isolines_per_period(
+    PuncturedMesh const& punctured,
+    Eigen::VectorXd const& s,
+    double leaf_spacing_edges)
+{
+    double const median = quantile(edge_phases(punctured, s), 0.5);
+    if (median <= 0.0 || leaf_spacing_edges <= 0.0) {
+        return 1;
+    }
+    double const levels = std::round(
+        2.0 * std::numbers::pi / (leaf_spacing_edges * median));
+    return std::clamp(static_cast<int>(levels), 1, 256);
 }
 
 struct RescaleResult {
