@@ -8,6 +8,7 @@
 #include <Eigen/SparseCholesky>
 
 #include <cmath>
+#include <functional>
 #include <numbers>
 #include <random>
 #include <ranges>
@@ -187,7 +188,8 @@ inline InitialScaleResult initial_rescaling_at(
     int krylov_size,
     double tolerance,
     double max_negative_area = 0.02,
-    double scalar_weight_floor = omega_floor)
+    double scalar_weight_floor = omega_floor,
+    std::function<void(int, int)> const& on_step = {})
 {
     MeshTables const tables = mesh_tables(punctured.sub->mesh());
     ScaleSystem const system =
@@ -260,6 +262,9 @@ inline InitialScaleResult initial_rescaling_at(
         }
         double const b = std::sqrt(std::max(inner(w, w), 0.0));
         steps = j + 1;
+        if (on_step) {
+            on_step(steps, krylov_size);
+        }
         if (b <= tolerance * std::abs(a)) {
             break; // invariant subspace found
         }
@@ -350,7 +355,8 @@ inline InitialScaleResult initial_rescaling(
     int krylov_size,
     double tolerance,
     double max_negative_area = 0.02,
-    double scalar_weight_floor = omega_floor)
+    double scalar_weight_floor = omega_floor,
+    std::function<void(int, int)> const& on_step = {})
 {
     InitialScaleResult result;
     for (double mu = mu_start; mu <= mu_max * (1.0 + 1e-12); mu *= 10.0) {
@@ -361,7 +367,8 @@ inline InitialScaleResult initial_rescaling(
             krylov_size,
             tolerance,
             max_negative_area,
-            scalar_weight_floor);
+            scalar_weight_floor,
+            on_step);
         if (result.sign_consistent) {
             break;
         }

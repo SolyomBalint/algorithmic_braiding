@@ -9,12 +9,16 @@
 
 #include <directional/directional_viewer.h>
 
+#include <algorithm>
+#include <cfloat>
+#include <chrono>
 #include <exception>
 #include <iterator>
 #include <memory>
 #include <optional>
 #include <print>
 #include <ranges>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -78,8 +82,7 @@ constexpr DemoPreset demo_presets[] = {
         .mu_theta = 0.01,
         .isolines_per_period = 4 },
 };
-constexpr int demo_preset_count =
-    static_cast<int>(std::size(demo_presets));
+constexpr int demo_preset_count = static_cast<int>(std::size(demo_presets));
 
 std::string preset_path(DemoPreset const& preset)
 {
@@ -87,12 +90,16 @@ std::string preset_path(DemoPreset const& preset)
 }
 
 int selected_preset = 0;
-std::unique_ptr<Session> session =
-    std::make_unique<Session>(preset_path(demo_presets[0]));
+std::unique_ptr<Session> session
+    = std::make_unique<Session>(preset_path(demo_presets[0]));
 directional::DirectionalViewer viewer;
 polyscope::SurfaceFaceScalarQuantity* curl_quantity = nullptr;
-bool singularities_enabled = true;
+bool singularities_enabled = false;
 bool curl_enabled = false;
+bool streamlines_enabled = false;
+bool streamlines_ready = false;
+int streamline_steps = 80;
+double streamline_dist_ratio = 1.0;
 double smoothness = 100.0;
 double lambda_end = 1e-8;
 double shrink = 10.0;
@@ -125,6 +132,33 @@ void apply_preset(DemoPreset const& preset)
 
 constexpr char const* isolines_name = "Isolines";
 constexpr char const* punctured_faces_name = "punctured faces";
+constexpr char const* streamlines_name = "Streamlines 0";
+
+void clear_streamlines()
+{
+    polyscope::removeStructure(streamlines_name, false);
+    streamlines_ready = false;
+}
+
+void trace_streamlines()
+{
+    directional::CartesianField const& field
+        = session->geodesic_field.field();
+    if (!viewer.slState.empty()) {
+        viewer.slState[0] = directional::StreamlineState {};
+    }
+    viewer.init_streamlines(field, 0, Eigen::VectorXi(),
+        std::max(0.1, streamline_dist_ratio));
+    int const steps = std::max(1, streamline_steps);
+    double const d_time = 0.5 * field.tb->avgAdjLength;
+    for (int const i : std::views::iota(0, steps - 1)) {
+        directional::streamlines_next(
+            viewer.slData[0], viewer.slState[0], d_time);
+    }
+    viewer.advance_streamlines(0.5);
+    viewer.toggle_streamlines(streamlines_enabled);
+    streamlines_ready = true;
+}
 
 void reset_viewer()
 {
@@ -132,6 +166,7 @@ void reset_viewer()
     polyscope::removeStructure("Field 0", false);
     polyscope::removeStructure("Singularities 0", false);
     polyscope::removeStructure(isolines_name, false);
+    clear_streamlines();
     curl_quantity = nullptr;
     viewer.set_surface_mesh(session->weaving_mesh.mesh());
     viewer.set_cartesian_field(session->geodesic_field.field());
@@ -139,6 +174,9 @@ void reset_viewer()
     curl_quantity = viewer.set_surface_face_data(
         session->geodesic_field.face_curl(), "curl");
     curl_quantity->setEnabled(curl_enabled);
+    if (streamlines_enabled) {
+        trace_streamlines();
+    }
 }
 
 void refresh_viewer()
@@ -149,6 +187,11 @@ void refresh_viewer()
     Eigen::VectorXd const curl = session->geodesic_field.face_curl();
     curl_quantity->updateData(curl);
     curl_quantity->setMapRange({ curl.minCoeff(), curl.maxCoeff() });
+    if (streamlines_enabled) {
+        trace_streamlines();
+    } else {
+        clear_streamlines();
+    }
 }
 
 void load_preset(int index)
@@ -171,9 +214,10 @@ void load_preset(int index)
 Eigen::VectorXd faces_to_original(Eigen::VectorXd const& values)
 {
     PuncturedMesh const& punctured = *session->punctured;
-    Eigen::VectorXd full = Eigen::VectorXd::Zero(
-        session->weaving_mesh.mesh().F.rows());
-    for (int const face : std::views::iota(0, static_cast<int>(values.size()))) {
+    Eigen::VectorXd full
+        = Eigen::VectorXd::Zero(session->weaving_mesh.mesh().F.rows());
+    for (int const face :
+        std::views::iota(0, static_cast<int>(values.size()))) {
         full(punctured.face_to_original(face)) = values(face);
     }
     return full;
@@ -182,8 +226,8 @@ Eigen::VectorXd faces_to_original(Eigen::VectorXd const& values)
 Eigen::VectorXd vertices_to_original(Eigen::VectorXd const& values)
 {
     PuncturedMesh const& punctured = *session->punctured;
-    Eigen::VectorXd full = Eigen::VectorXd::Zero(
-        session->weaving_mesh.mesh().V.rows());
+    Eigen::VectorXd full
+        = Eigen::VectorXd::Zero(session->weaving_mesh.mesh().V.rows());
     for (int const vertex :
         std::views::iota(0, static_cast<int>(values.size()))) {
         full(punctured.vertex_to_original(vertex)) = values(vertex);
@@ -200,11 +244,11 @@ void show_scale()
 void run_puncture()
 {
     session->geodesic_field.update_singularities();
-    session->punctured =
-        puncture(session->weaving_mesh, session->geodesic_field);
+    session->punctured
+        = puncture(session->weaving_mesh, session->geodesic_field);
     PuncturedMesh const& punctured = *session->punctured;
-    session->punctured_operators =
-        assemble_face_field_operators(*punctured.sub);
+    session->punctured_operators
+        = assemble_face_field_operators(*punctured.sub);
     session->scale.resize(0);
     session->foliation.reset();
     polyscope::removeStructure(isolines_name, false);
@@ -212,24 +256,13 @@ void run_puncture()
         "puncture: {} singular vertices, {} faces deleted, {} faces / {} "
         "vertices remain",
         session->geodesic_field.field().singLocalCycles.size(),
-        punctured.deleted_faces.size(),
-        punctured.sub->mesh().F.rows(),
+        punctured.deleted_faces.size(), punctured.sub->mesh().F.rows(),
         punctured.sub->mesh().V.rows());
     viewer.highlight_faces(punctured.deleted_faces, punctured_faces_name);
 }
 
-void run_initial_scale()
+void accept_initial_scale(InitialScaleResult const& result)
 {
-    if (!session->punctured) {
-        run_puncture();
-    }
-    InitialScaleResult const result = initial_rescaling(
-        *session->punctured,
-        session->punctured_operators,
-        mu_scale,
-        mu_scale_max,
-        scale_krylov_size,
-        1e-10);
     session->scale = result.s;
     session->foliation.reset();
     std::println(
@@ -237,18 +270,23 @@ void run_initial_scale()
         "negative-area fractions {}, chose mode {}",
         result.mu,
         result.sign_consistent ? "sign-consistent" : "NO sign-consistent mode",
-        result.iterations,
-        result.lowest_eigenvalues.transpose(),
-        result.negative_area_fractions.transpose(),
-        result.chosen_mode);
+        result.iterations, result.lowest_eigenvalues.transpose(),
+        result.negative_area_fractions.transpose(), result.chosen_mode);
     std::println(
         "initial s: rayleigh {}, ‖δ‖_M {}, ‖C(sŵ⊥+δ)‖ {}, s ∈ [{}, {}]",
-        result.rayleigh_quotient,
-        result.residual_norm,
-        result.constraint_norm,
-        result.s.minCoeff(),
-        result.s.maxCoeff());
+        result.rayleigh_quotient, result.residual_norm, result.constraint_norm,
+        result.s.minCoeff(), result.s.maxCoeff());
     show_scale();
+}
+
+void run_initial_scale()
+{
+    if (!session->punctured) {
+        run_puncture();
+    }
+    accept_initial_scale(
+        initial_rescaling(*session->punctured, session->punctured_operators,
+            mu_scale, mu_scale_max, scale_krylov_size, 1e-10));
 }
 
 void run_rescale()
@@ -256,29 +294,23 @@ void run_rescale()
     if (session->scale.size() == 0) {
         run_initial_scale();
     }
-    RescaleResult const result =
-        global_rescale(*session->punctured, session->scale, scale_multiplier);
-    std::println(
-        "global rescale: ρ = {}, factor {}, s ∈ [{}, {}]",
-        result.rho,
-        result.factor,
-        session->scale.minCoeff(),
-        session->scale.maxCoeff());
+    RescaleResult const result
+        = global_rescale(*session->punctured, session->scale, scale_multiplier);
+    std::println("global rescale: ρ = {}, factor {}, s ∈ [{}, {}]", result.rho,
+        result.factor, session->scale.minCoeff(), session->scale.maxCoeff());
     show_scale();
 }
 
 void show_foliation()
 {
     Foliation const& foliation = *session->foliation;
-    FoliationDiagnostics const diagnostics =
-        foliation_diagnostics(*session->punctured, foliation);
-    std::println(
-        "foliation: {} aliased faces, mean alignment error {}",
-        diagnostics.aliased_count,
-        diagnostics.alignment.mean());
+    FoliationDiagnostics const diagnostics
+        = foliation_diagnostics(*session->punctured, foliation);
+    std::println("foliation: {} aliased faces, mean alignment error {}",
+        diagnostics.aliased_count, diagnostics.alignment.mean());
 
-    polyscope::SurfaceVertexScalarQuantity* theta_quantity =
-        viewer.set_surface_vertex_data(
+    polyscope::SurfaceVertexScalarQuantity* theta_quantity
+        = viewer.set_surface_vertex_data(
             vertices_to_original(foliation.theta), "theta");
     theta_quantity->setColorMap("phase");
     theta_quantity->setMapRange({ -std::numbers::pi, std::numbers::pi });
@@ -305,10 +337,9 @@ void run_isolines()
     if (!session->foliation) {
         run_alternate();
     }
-    IsolineCurves const curves = periodic_isolines(
-        session->punctured->sub->mesh(),
-        session->foliation->theta,
-        isolines_per_period);
+    IsolineCurves const curves
+        = periodic_isolines(session->punctured->sub->mesh(),
+            session->foliation->theta, isolines_per_period);
     std::println("isolines: {} segments", curves.edges.rows());
     polyscope::removeStructure(isolines_name, false);
     polyscope::CurveNetwork* network = polyscope::registerCurveNetwork(
@@ -329,8 +360,311 @@ void guarded(char const* label, Step step)
     }
 }
 
+struct JobCancelled : std::runtime_error {
+    JobCancelled()
+        : std::runtime_error("cancelled")
+    {
+    }
+};
+
+enum class JobKind { Idle, Optimize, Recover };
+enum class RecoverStage { Puncture, InitialS, Rescale, Alternate, Isolines };
+
+struct JobState {
+    JobKind kind = JobKind::Idle;
+    bool cancel = false;
+    RecoverStage recover_stage = RecoverStage::Puncture;
+    RecoverStage recover_until = RecoverStage::Isolines;
+    std::string stage;
+    std::string plot_label = "energy";
+    std::vector<float> plot;
+    float last_value = 0.0f;
+    double lambda = 0.0;
+    double mu = 0.0;
+    double current_lambda = 0.0;
+    double current_mu = 0.0;
+    int iter = 0;
+    int max_iter = 0;
+    int level_iter = 0;
+    bool unconstrained_done = false;
+    bool enforce_curl = false;
+};
+
+JobState job;
+std::chrono::steady_clock::time_point last_ui_pump {};
+
+void append_plot(double value)
+{
+    constexpr int cap = 512;
+    job.plot.push_back(static_cast<float>(value));
+    if (static_cast<int>(job.plot.size()) > cap) {
+        job.plot.erase(job.plot.begin(),
+            job.plot.begin() + static_cast<int>(job.plot.size()) - cap);
+    }
+    job.last_value = static_cast<float>(value);
+}
+
+void pump_ui(bool force)
+{
+    using clock = std::chrono::steady_clock;
+    auto const now = clock::now();
+    if (!force && last_ui_pump != clock::time_point {}
+        && now - last_ui_pump < std::chrono::milliseconds(300)) {
+        return;
+    }
+    last_ui_pump = now;
+    if (polyscope::windowRequestsClose()) {
+        job.cancel = true;
+    }
+    auto const saved_limit = polyscope::options::frameTickLimitFPSMode;
+    polyscope::options::frameTickLimitFPSMode
+        = polyscope::LimitFPSMode::IgnoreLimits;
+    polyscope::requestRedraw();
+    polyscope::frameTick();
+    polyscope::options::frameTickLimitFPSMode = saved_limit;
+}
+
+void finish_job()
+{
+    job.kind = JobKind::Idle;
+    job.cancel = false;
+    job.stage.clear();
+    polyscope::requestRedraw();
+}
+
+void start_optimize()
+{
+    if (shrink <= 1.0 || smoothness < lambda_end) {
+        std::println("optimize: need shrink > 1 and lambda >= lambda end");
+        return;
+    }
+    job = JobState {};
+    job.kind = JobKind::Optimize;
+    job.stage = "optimize";
+    job.plot_label = "energy";
+    job.current_lambda = smoothness;
+    job.max_iter = max_iterations;
+}
+
+void start_recover(RecoverStage from, RecoverStage until)
+{
+    job = JobState {};
+    job.kind = JobKind::Recover;
+    job.recover_stage = from;
+    job.recover_until = until;
+    job.current_mu = mu_scale;
+    job.stage = "recover";
+    job.plot_label = "energy";
+}
+
+void tick_optimize()
+{
+    if (job.cancel) {
+        throw JobCancelled {};
+    }
+    double const lambda = job.current_lambda;
+    bool const curl = job.unconstrained_done;
+    job.lambda = lambda;
+    job.enforce_curl = curl;
+    job.stage = curl ? "optimize" : "optimize (smooth start)";
+    job.max_iter = max_iterations;
+
+    double const change = curl
+        ? session->geodesic_optimizer.step(lambda)
+        : session->geodesic_optimizer.step_unconstrained(lambda);
+    job.level_iter += 1;
+    job.iter = job.level_iter;
+    append_plot(session->geodesic_optimizer.energy(lambda).total);
+
+    bool const level_done = job.level_iter >= max_iterations
+        || change < session->geodesic_optimizer.mass_norm_threshold(epsilon);
+    if (!level_done) {
+        return;
+    }
+
+    std::println("λ={}  {}  level done: {} iterations", lambda,
+        curl ? "C" : "no-C", job.level_iter);
+    refresh_viewer();
+
+    if (!job.unconstrained_done) {
+        job.unconstrained_done = true;
+        job.level_iter = 0;
+        return;
+    }
+    if (lambda <= lambda_end) {
+        finish_job();
+        return;
+    }
+    job.current_lambda = std::max(lambda / shrink, lambda_end);
+    job.level_iter = 0;
+}
+
+void tick_initial_s()
+{
+    if (!session->punctured) {
+        job.recover_stage = RecoverStage::Puncture;
+        return;
+    }
+    job.stage = "initial s";
+    job.plot_label = "rayleigh";
+    job.mu = job.current_mu;
+    job.lambda = 0.0;
+    InitialScaleResult const result = initial_rescaling_at(*session->punctured,
+        session->punctured_operators, job.current_mu, scale_krylov_size, 1e-10,
+        0.02, omega_floor, [](int step, int krylov) {
+            if (job.cancel) {
+                throw JobCancelled {};
+            }
+            job.iter = step;
+            job.max_iter = krylov;
+            pump_ui(false);
+        });
+    accept_initial_scale(result);
+    append_plot(result.rayleigh_quotient);
+    bool const done_mu = result.sign_consistent
+        || job.current_mu >= mu_scale_max * (1.0 + 1e-12);
+    if (!done_mu) {
+        job.current_mu *= 10.0;
+        return;
+    }
+    if (job.recover_until == RecoverStage::InitialS) {
+        finish_job();
+        return;
+    }
+    job.recover_stage = RecoverStage::Rescale;
+}
+
+void tick_alternate()
+{
+    if (session->scale.size() == 0) {
+        job.recover_stage = RecoverStage::Rescale;
+        return;
+    }
+    job.stage = "alternate";
+    job.plot_label = "energy(8)";
+    job.max_iter = alternations;
+    FoliationSolver const solver(*session->punctured, mu_theta);
+    session->foliation
+        = solver.alternate(session->scale, alternations, theta_power_iterations,
+            [](int round, int total, Foliation const& foliation,
+                double energy_value, double) {
+                if (job.cancel) {
+                    throw JobCancelled {};
+                }
+                job.iter = round;
+                job.max_iter = total;
+                session->foliation = foliation;
+                session->scale = foliation.s;
+                show_foliation();
+                append_plot(energy_value);
+                pump_ui(true);
+            });
+    session->scale = session->foliation->s;
+    if (job.recover_until == RecoverStage::Alternate) {
+        finish_job();
+        return;
+    }
+    job.recover_stage = RecoverStage::Isolines;
+}
+
+void tick_recover()
+{
+    if (job.cancel) {
+        throw JobCancelled {};
+    }
+    switch (job.recover_stage) {
+    case RecoverStage::Puncture:
+        job.stage = "puncture";
+        run_puncture();
+        job.current_mu = mu_scale;
+        if (job.recover_until == RecoverStage::Puncture) {
+            finish_job();
+            return;
+        }
+        job.recover_stage = RecoverStage::InitialS;
+        break;
+    case RecoverStage::InitialS:
+        tick_initial_s();
+        break;
+    case RecoverStage::Rescale:
+        job.stage = "rescale s";
+        run_rescale();
+        if (job.recover_until == RecoverStage::Rescale) {
+            finish_job();
+            return;
+        }
+        job.recover_stage = RecoverStage::Alternate;
+        break;
+    case RecoverStage::Alternate:
+        tick_alternate();
+        break;
+    case RecoverStage::Isolines:
+        job.stage = "isolines";
+        run_isolines();
+        finish_job();
+        break;
+    }
+}
+
+void pump_job()
+{
+    if (job.kind == JobKind::Idle) {
+        return;
+    }
+    try {
+        if (job.kind == JobKind::Optimize) {
+            tick_optimize();
+        } else {
+            tick_recover();
+        }
+    } catch (JobCancelled const&) {
+        std::println("{} cancelled", job.stage);
+        finish_job();
+    } catch (std::exception const& error) {
+        std::println("{} failed: {}", job.stage, error.what());
+        finish_job();
+    }
+}
+
+void draw_job_ui()
+{
+    if (job.kind == JobKind::Idle) {
+        return;
+    }
+    ImGui::Separator();
+    char const spin[] = "|/-\\";
+    int const frame = static_cast<int>(ImGui::GetTime() * 8.0) % 4;
+    ImGui::Text("%c  %s", spin[frame], job.stage.c_str());
+    if (job.kind == JobKind::Optimize) {
+        ImGui::Text("λ=%g  %s  it=%d/%d", job.lambda,
+            job.enforce_curl ? "C" : "no-C", job.iter, job.max_iter);
+    } else if (job.mu != 0.0) {
+        ImGui::Text("μ=%g  it=%d/%d", job.mu, job.iter, job.max_iter);
+    } else if (job.max_iter > 0) {
+        ImGui::Text("it=%d/%d", job.iter, job.max_iter);
+    }
+    if (job.max_iter > 0) {
+        ImGui::ProgressBar(
+            static_cast<float>(job.iter) / static_cast<float>(job.max_iter),
+            ImVec2(-1.0f, 0.0f));
+    }
+    if (!job.plot.empty()) {
+        ImGui::PlotLines("##jobplot", job.plot.data(),
+            static_cast<int>(job.plot.size()), 0, job.plot_label.c_str(),
+            FLT_MAX, FLT_MAX, ImVec2(0.0f, 64.0f));
+        ImGui::Text("%s = %g", job.plot_label.c_str(), job.last_value);
+    }
+    if (ImGui::Button("cancel")) {
+        job.cancel = true;
+    }
+}
+
 void callback()
 {
+    draw_job_ui();
+    bool const busy = job.kind != JobKind::Idle;
+    ImGui::BeginDisabled(busy);
+
     if (ImGui::BeginCombo("mesh", demo_presets[selected_preset].label)) {
         for (int const i : std::views::iota(0, demo_preset_count)) {
             bool const selected = i == selected_preset;
@@ -349,22 +683,8 @@ void callback()
     ImGui::InputDouble("shrink", &shrink);
     ImGui::InputDouble("epsilon", &epsilon);
     ImGui::InputInt("max iterations", &max_iterations);
-    if (ImGui::Button("algorithm 1 step")) {
-        (void)session->geodesic_optimizer.step(smoothness);
-        refresh_viewer();
-    }
     if (ImGui::Button("optimize")) {
-        session->geodesic_optimizer.optimize(
-            smoothness, lambda_end, shrink, epsilon, max_iterations);
-        refresh_viewer();
-    }
-    if (ImGui::Button("perturb field")) {
-        session->geodesic_field.perturb_random();
-        refresh_viewer();
-    }
-    if (ImGui::Button("smooth init")) {
-        session->geodesic_field.init_smooth();
-        refresh_viewer();
+        start_optimize();
     }
     if (ImGui::Button("toggle curl map")) {
         curl_enabled = !curl_quantity->isEnabled();
@@ -373,6 +693,16 @@ void callback()
     if (ImGui::Button("toggle singularities")) {
         singularities_enabled = !singularities_enabled;
         viewer.toggle_singularities(singularities_enabled);
+    }
+    ImGui::InputInt("streamline steps", &streamline_steps);
+    ImGui::InputDouble("streamline spacing", &streamline_dist_ratio);
+    if (ImGui::Button("toggle streamlines")) {
+        streamlines_enabled = !streamlines_enabled;
+        if (streamlines_enabled) {
+            trace_streamlines();
+        } else if (streamlines_ready) {
+            viewer.toggle_streamlines(false);
+        }
     }
 
     ImGui::Separator();
@@ -389,26 +719,30 @@ void callback()
         guarded("puncture", run_puncture);
     }
     if (ImGui::Button("initial s")) {
-        guarded("initial s", run_initial_scale);
+        RecoverStage const from = session->punctured ? RecoverStage::InitialS
+                                                     : RecoverStage::Puncture;
+        start_recover(from, RecoverStage::InitialS);
     }
     if (ImGui::Button("rescale s")) {
         guarded("rescale s", run_rescale);
     }
     if (ImGui::Button("alternate theta/s")) {
-        guarded("alternate", run_alternate);
+        RecoverStage from = RecoverStage::Alternate;
+        if (!session->punctured) {
+            from = RecoverStage::Puncture;
+        } else if (session->scale.size() == 0) {
+            from = RecoverStage::InitialS;
+        }
+        start_recover(from, RecoverStage::Alternate);
     }
     if (ImGui::Button("extract isolines")) {
         guarded("isolines", run_isolines);
     }
     if (ImGui::Button("recover foliation (all)")) {
-        guarded("recover foliation", [] {
-            run_puncture();
-            run_initial_scale();
-            run_rescale();
-            run_alternate();
-            run_isolines();
-        });
+        start_recover(RecoverStage::Puncture, RecoverStage::Isolines);
     }
+
+    ImGui::EndDisabled();
 }
 
 int main()
@@ -417,7 +751,13 @@ int main()
     apply_preset(demo_presets[selected_preset]);
     reset_viewer();
     viewer.set_callback(callback);
-    viewer.launch();
+    while (!polyscope::windowRequestsClose()) {
+        pump_job();
+        if (polyscope::windowRequestsClose()) {
+            break;
+        }
+        polyscope::frameTick();
+    }
 
     return 0;
 }

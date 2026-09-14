@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <complex>
+#include <functional>
 #include <numbers>
 #include <print>
 #include <random>
@@ -42,6 +43,14 @@ struct Foliation {
 // dimensionless, as in scale_field.h: the data term scales with d² ~ h²).
 class FoliationSolver {
 public:
+    // Where the s-step linearizes the wrapped residual. `false`: about the
+    // current s⁰ (targets s⁰d + wrap(Δθ − s⁰d), which can walk onto branches
+    // with |s d| > π and lets s grow or flip sign). `true`: about s = 0
+    // (targets wrap(Δθ) ∈ [−π, π), as in the reference code), which keeps
+    // every edge phase within half a period, the assumption of the global
+    // rescale.
+    bool linearize_at_zero = false;
+
     FoliationSolver(PuncturedMesh const& punctured, double mu)
         : punctured_(&punctured)
     {
@@ -57,8 +66,8 @@ public:
             for (int const corner : std::views::iota(0, 3)) {
                 int const alpha = tables.faces(face, corner);
                 int const beta = tables.faces(face, (corner + 1) % 3);
-                Eigen::RowVector3d const step =
-                    tables.vertex_positions.row(beta)
+                Eigen::RowVector3d const step
+                    = tables.vertex_positions.row(beta)
                     - tables.vertex_positions.row(alpha);
                 phase_per_unit_s_(face, corner) = perp.row(face).dot(step);
                 weight_(face, corner) = edge_cotan_weight(
@@ -67,8 +76,8 @@ public:
         }
 
         scalar_laplacian_ = face_scalar_laplacian(tables);
-        vertex_mass_ =
-            directional::lumped_voronoi_mass_matrix_2D<double>(mesh).diagonal();
+        vertex_mass_ = directional::lumped_voronoi_mass_matrix_2D<double>(mesh)
+                           .diagonal();
     }
 
     // θ-step: with z_v = R(θ_v) ∈ R² and the unit constraint relaxed to
@@ -78,9 +87,7 @@ public:
     // The minimizer is the smallest generalized eigenvector of (L_d, M_V⊗I₂),
     // found by inverse power iteration [Knöppel et al. 2015].
     // Returns the Rayleigh quotient zᵀ L_d z / zᵀ M z.
-    double theta_step(
-        Eigen::VectorXd const& s,
-        int power_iterations,
+    double theta_step(Eigen::VectorXd const& s, int power_iterations,
         Eigen::VectorXd& theta) const
     {
         MeshTables const tables = mesh_tables(punctured_->sub->mesh());
@@ -125,8 +132,7 @@ public:
         }
 
         // Tiny shift guards the exactly-integrable case (λ_min = 0).
-        double const shift =
-            1e-8 * laplacian.diagonal().sum() / mass.sum();
+        double const shift = 1e-8 * laplacian.diagonal().sum() / mass.sum();
         Eigen::SparseMatrix<double> shifted = laplacian;
         for (int const i : std::views::iota(0, size)) {
             shifted.coeffRef(i, i) += shift * mass(i);
@@ -161,7 +167,8 @@ public:
             z = solver.solve(mass.cwiseProduct(z));
             z /= mass_norm(z);
         }
-        double const rayleigh = z.dot(laplacian * z) / z.dot(mass.cwiseProduct(z));
+        double const rayleigh
+            = z.dot(laplacian * z) / z.dot(mass.cwiseProduct(z));
 
         theta.resize(vertex_count);
         for (int const vertex : std::views::iota(0, vertex_count)) {
@@ -188,9 +195,9 @@ public:
                 int const beta = tables.faces(face, (corner + 1) % 3);
                 double const omega = weight_(face, corner);
                 double const d = phase_per_unit_s_(face, corner);
-                double const current = s(face) * d;
-                double const target =
-                    current + wrap_angle(theta(beta) - theta(alpha) - current);
+                double const current = linearize_at_zero ? 0.0 : s(face) * d;
+                double const target = current
+                    + wrap_angle(theta(beta) - theta(alpha) - current);
                 diagonal(face) += omega * d * d;
                 rhs(face) += omega * d * target;
             }
@@ -209,8 +216,7 @@ public:
     }
 
     [[nodiscard]] double energy(
-        Eigen::VectorXd const& theta,
-        Eigen::VectorXd const& s) const
+        Eigen::VectorXd const& theta, Eigen::VectorXd const& s) const
     {
         MeshTables const tables = mesh_tables(punctured_->sub->mesh());
         int const face_count = tables.faces.rows();
@@ -230,53 +236,50 @@ public:
     }
 
     // Alternate θ- and s-steps, ending on a θ-step so θ matches the final s.
-    [[nodiscard]] Foliation alternate(
-        Eigen::VectorXd s,
-        int alternations,
-        int power_iterations) const
+    [[nodiscard]] Foliation alternate(Eigen::VectorXd s, int alternations,
+        int power_iterations,
+        std::function<void(int, int, Foliation const&, double, double)> const&
+            on_round
+        = {}) const
     {
         Foliation foliation;
         foliation.s = std::move(s);
         Eigen::VectorXd previous_theta;
         for (int const round : std::views::iota(1, alternations + 1)) {
-            double const rayleigh =
-                theta_step(foliation.s, power_iterations, foliation.theta);
+            double const rayleigh
+                = theta_step(foliation.s, power_iterations, foliation.theta);
             // θ is defined up to a global phase: remove the best-fit
             // rotation before measuring the change.
             double theta_change = 0.0;
             if (previous_theta.size() == foliation.theta.size()) {
                 std::complex<double> mean_rotation = 0.0;
-                for (int const v :
-                    std::views::iota(0, static_cast<int>(previous_theta.size()))) {
+                for (int const v : std::views::iota(
+                         0, static_cast<int>(previous_theta.size()))) {
                     mean_rotation += std::polar(
                         1.0, foliation.theta(v) - previous_theta(v));
                 }
                 double const phase = std::arg(mean_rotation);
-                for (int const v :
-                    std::views::iota(0, static_cast<int>(previous_theta.size()))) {
-                    theta_change += std::pow(
-                        wrap_angle(
-                            foliation.theta(v) - previous_theta(v) - phase),
+                for (int const v : std::views::iota(
+                         0, static_cast<int>(previous_theta.size()))) {
+                    theta_change += std::pow(wrap_angle(foliation.theta(v)
+                                                 - previous_theta(v) - phase),
                         2);
                 }
                 theta_change = std::sqrt(theta_change);
             }
             previous_theta = foliation.theta;
             double const total = energy(foliation.theta, foliation.s);
-            std::println(
-                "alternation {}: rayleigh {}  energy(8) {}  ‖Δθ‖ {}",
-                round,
-                rayleigh,
-                total,
-                theta_change);
+            std::println("alternation {}: rayleigh {}  energy(8) {}  ‖Δθ‖ {}",
+                round, rayleigh, total, theta_change);
+            if (on_round) {
+                on_round(round, alternations, foliation, total, rayleigh);
+            }
             if (round == alternations) {
                 break;
             }
             Eigen::VectorXd const before = foliation.s;
             s_step(foliation.theta, foliation.s);
-            std::println(
-                "alternation {}: ‖Δs‖ {}  energy(8) {}",
-                round,
+            std::println("alternation {}: ‖Δs‖ {}  energy(8) {}", round,
                 (foliation.s - before).norm(),
                 energy(foliation.theta, foliation.s));
         }
@@ -286,10 +289,7 @@ public:
 private:
     // The mesh edge joining two corners of `face`.
     static int edge_between(
-        MeshTables const& tables,
-        int face,
-        int vertex_a,
-        int vertex_b)
+        MeshTables const& tables, int face, int vertex_a, int vertex_b)
     {
         for (int const side : std::views::iota(0, 3)) {
             int const edge = tables.face_edges(face, side);
@@ -314,18 +314,16 @@ private:
 // Per-face quality measures of a recovered foliation.
 struct FoliationDiagnostics {
     Eigen::VectorXd alignment; // angle(∇θ, s ŵ⊥)/π ∈ [0, 1], 0 = aligned
-    Eigen::VectorXi aliased; // 1 where the wrapped corner differences don't close
+    Eigen::VectorXi
+        aliased; // 1 where the wrapped corner differences don't close
     int aliased_count = 0;
 };
 
 // Unwrap the three corner values of a face relative to corner 0.
 // Returns false when the wrapped differences don't sum to zero, i.e. θ
 // winds around inside the face (aliased).
-inline bool unwrap_face(
-    Eigen::VectorXd const& theta,
-    Eigen::MatrixXi const& faces,
-    int face,
-    Eigen::Vector3d& unwrapped)
+inline bool unwrap_face(Eigen::VectorXd const& theta,
+    Eigen::MatrixXi const& faces, int face, Eigen::Vector3d& unwrapped)
 {
     double const t0 = theta(faces(face, 0));
     double const t1 = theta(faces(face, 1));
@@ -338,8 +336,7 @@ inline bool unwrap_face(
 }
 
 inline FoliationDiagnostics foliation_diagnostics(
-    PuncturedMesh const& punctured,
-    Foliation const& foliation)
+    PuncturedMesh const& punctured, Foliation const& foliation)
 {
     directional::TriMesh const& mesh = punctured.sub->mesh();
     int const face_count = mesh.F.rows();
@@ -363,8 +360,10 @@ inline FoliationDiagnostics foliation_diagnostics(
         Eigen::RowVector3d const normal = mesh.faceNormals.row(face);
         double const area = mesh.faceAreas(face);
         // P1 gradient: ∇φ_j = n × e_j / (2A), e_j the edge opposite corner j.
-        Eigen::RowVector3d const grad_phi1 = normal.cross(p0 - p2) / (2.0 * area);
-        Eigen::RowVector3d const grad_phi2 = normal.cross(p1 - p0) / (2.0 * area);
+        Eigen::RowVector3d const grad_phi1
+            = normal.cross(p0 - p2) / (2.0 * area);
+        Eigen::RowVector3d const grad_phi2
+            = normal.cross(p1 - p0) / (2.0 * area);
         Eigen::RowVector3d const gradient = (values(1) - values(0)) * grad_phi1
             + (values(2) - values(0)) * grad_phi2;
         Eigen::RowVector3d const target = foliation.s(face) * perp.row(face);

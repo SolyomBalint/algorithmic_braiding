@@ -112,6 +112,35 @@ public:
         return residual_;
     }
 
+    struct EnergyBreakdown {
+        double mass_term = 0.0;
+        double smoothness_term = 0.0;
+        double total = 0.0;
+        double curl_norm = 0.0;
+    };
+
+    [[nodiscard]] EnergyBreakdown energy(double lambda) const
+    {
+        Eigen::VectorXd const design_field =
+            flatten_intrinsic(geodesic_field_.field());
+        Eigen::VectorXd const corrected = design_field + residual_;
+        EnergyBreakdown out;
+        out.mass_term = 0.5
+            * residual_.dot(field_operators_.mass_matrix * residual_);
+        out.smoothness_term = 0.5 * lambda
+            * corrected.dot(
+                field_operators_.smoothness_matrix * corrected);
+        out.total = out.mass_term + out.smoothness_term;
+        out.curl_norm =
+            (field_operators_.curl_matrix * corrected).norm();
+        return out;
+    }
+
+    [[nodiscard]] double mass_norm_threshold(double epsilon) const
+    {
+        return epsilon * std::sqrt(total_area_);
+    }
+
 private:
     // App. B typesets (M + λ L) δ = -λ L (u+δ). L is NSD and δ is unknown:
     // both wrong. Stationarity of Eq. (5) is this KKT with Q = -L (PSD):
@@ -238,12 +267,7 @@ private:
         Eigen::VectorXd const delta_u = design_field - previous;
         double const field_change = std::sqrt(
             delta_u.dot(field_operators_.mass_matrix * delta_u));
-        print_energy(
-            lambda,
-            enforce_curl,
-            iteration,
-            field_change,
-            design_field);
+        print_energy(lambda, enforce_curl, iteration, field_change);
         return field_change;
     }
 
@@ -269,27 +293,19 @@ private:
         double lambda,
         bool enforce_curl,
         int iteration,
-        double field_change,
-        Eigen::VectorXd const& design_field) const
+        double field_change) const
     {
-        Eigen::VectorXd const corrected = design_field + residual_;
-        double const mass_term = 0.5
-            * residual_.dot(field_operators_.mass_matrix * residual_);
-        double const smoothness_term = 0.5 * lambda
-            * corrected.dot(
-                field_operators_.smoothness_matrix * corrected);
-        double const curl_norm =
-            (field_operators_.curl_matrix * corrected).norm();
+        EnergyBreakdown const terms = energy(lambda);
         std::println(
             "λ={}  {}  it={}  ‖Δu‖_M={}  energy {} + {} = {}  ||C(u+δ)|| {}",
             lambda,
             enforce_curl ? "C" : "no-C",
             iteration,
             field_change,
-            mass_term,
-            smoothness_term,
-            mass_term + smoothness_term,
-            curl_norm);
+            terms.mass_term,
+            terms.smoothness_term,
+            terms.total,
+            terms.curl_norm);
     }
 
     GeodesicField& geodesic_field_;
