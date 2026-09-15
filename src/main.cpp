@@ -8,6 +8,9 @@
 #include "weaving_mesh.h"
 
 #include <directional/directional_viewer.h>
+#include <glm/glm.hpp>
+#include <polyscope/render/color_maps.h>
+#include <polyscope/render/engine.h>
 #include <polyscope/view.h>
 
 #include <algorithm>
@@ -45,10 +48,6 @@ struct Session {
     }
 };
 
-// Demo presets: the two showcase meshes with the settings verified for
-// them (torus: no singularities, full λ sharpening; fertility: smooth start
-// and the reference's gentle schedule, otherwise Algorithm 1 crystallizes
-// dozens of singularities and Eq. (7) localizes).
 struct DemoPreset {
     char const* label;
     char const* filename;
@@ -65,7 +64,7 @@ struct DemoPreset {
 };
 
 constexpr DemoPreset demo_presets[] = {
-    { .label = "torus",
+    { .label = "torus-hex-param",
         .filename = "torus.obj",
         .lambda_start = 100.0,
         .lambda_end = 1e-8,
@@ -74,11 +73,11 @@ constexpr DemoPreset demo_presets[] = {
         .max_iterations = 50,
         .mu_scale = 1e-4,
         .mu_theta = 0.01,
-        .isolines_per_period = 4,
+        .isolines_per_period = 6,
         .auto_isoline_density = false,
         .leaf_spacing_edges = 5.0 },
-    { .label = "fertility",
-        .filename = "fertility.obj",
+    { .label = "aqua-center",
+        .filename = "aqua-center.off",
         .lambda_start = 100.0,
         .lambda_end = 0.01,
         .shrink = 10.0,
@@ -86,7 +85,19 @@ constexpr DemoPreset demo_presets[] = {
         .max_iterations = 10,
         .mu_scale = 1e-4,
         .mu_theta = 0.01,
-        .isolines_per_period = 4,
+        .isolines_per_period = 1,
+        .auto_isoline_density = false,
+        .leaf_spacing_edges = 5.0 },
+    { .label = "bunny",
+        .filename = "bunny.off",
+        .lambda_start = 100.0,
+        .lambda_end = 0.01,
+        .shrink = 10.0,
+        .epsilon = 1e-6,
+        .max_iterations = 10,
+        .mu_scale = 1e-4,
+        .mu_theta = 0.01,
+        .isolines_per_period = 11,
         .auto_isoline_density = false,
         .leaf_spacing_edges = 5.0 },
 };
@@ -100,14 +111,15 @@ std::string preset_path(DemoPreset const& preset)
 int selected_preset = 0;
 std::string custom_mesh_name;
 std::string last_mesh_path = preset_path(demo_presets[0]);
-char custom_mesh_path[1024] = "";
 std::unique_ptr<Session> session
     = std::make_unique<Session>(preset_path(demo_presets[0]));
 directional::DirectionalViewer viewer;
 polyscope::SurfaceFaceScalarQuantity* curl_quantity = nullptr;
 bool singularities_enabled = false;
 bool field_enabled = true;
-bool curl_enabled = false;
+bool curl_enabled = true;
+bool curl_vs_original = true;
+double curl_original_max = 1.0;
 bool streamlines_enabled = false;
 bool streamlines_ready = false;
 int streamline_steps = 80;
@@ -136,10 +148,10 @@ int isolines_per_period = 4;
 // meshes with a wide edge-length spread a fixed count per period gives leaves
 // dozens of edges apart. `auto` derives the count from the median edge phase
 // so leaves are ~`leaf_spacing_edges` typical edges apart.
-bool auto_isoline_density = true;
+bool auto_isoline_density = false;
 double leaf_spacing_edges = 5.0;
 double max_localized_area = 0.5; // Eq. (7) mode rejection: low-|s| area
-bool leaf_shading = false; // shader contours instead of the curve network
+bool leaf_shading = true; // shader contours instead of the curve network
 
 void apply_preset_params(DemoPreset const& preset)
 {
@@ -155,10 +167,57 @@ void apply_preset_params(DemoPreset const& preset)
     leaf_spacing_edges = preset.leaf_spacing_edges;
 }
 
+Eigen::VectorXd curl_abs()
+{
+    return session->geodesic_field.face_curl().cwiseAbs();
+}
+
+double curl_range_hi(Eigen::VectorXd const& mag)
+{
+    if (mag.size() == 0) {
+        return 1.0;
+    }
+    std::vector<double> values(mag.begin(), mag.end());
+    std::ranges::sort(values);
+    std::size_t const index = static_cast<std::size_t>(
+        0.99 * static_cast<double>(values.size() - 1));
+    double hi = values[index];
+    if (hi <= 0.0) {
+        hi = values.back();
+    }
+    if (hi <= 0.0) {
+        hi = 1.0;
+    }
+    return hi;
+}
+
+void capture_original_curl_range()
+{
+    curl_original_max = curl_range_hi(curl_abs());
+}
+
+void apply_curl_map_range(Eigen::VectorXd const& mag)
+{
+    if (curl_quantity == nullptr) {
+        return;
+    }
+    double const hi = curl_vs_original ? curl_original_max : curl_range_hi(mag);
+    curl_quantity->setColorMap("curl");
+    curl_quantity->setMapRange({ 0.0, hi });
+}
+
+void bind_curl_quantity(Eigen::VectorXd const& mag)
+{
+    curl_quantity = viewer.set_surface_face_data(mag, "curl");
+    curl_quantity->setEnabled(true);
+    apply_curl_map_range(mag);
+}
+
 void apply_preset(DemoPreset const& preset)
 {
     apply_preset_params(preset);
-    session->geodesic_field.init_smooth();
+    session->geodesic_field.perturb_random();
+    capture_original_curl_range();
 }
 
 constexpr char const* isolines_name = "Isolines";
@@ -176,13 +235,12 @@ void clear_streamlines()
 
 void trace_streamlines()
 {
-    directional::CartesianField const& field
-        = session->geodesic_field.field();
+    directional::CartesianField const& field = session->geodesic_field.field();
     if (!viewer.slState.empty()) {
         viewer.slState[0] = directional::StreamlineState {};
     }
-    viewer.init_streamlines(field, 0, Eigen::VectorXi(),
-        std::max(0.1, streamline_dist_ratio));
+    viewer.init_streamlines(
+        field, 0, Eigen::VectorXi(), std::max(0.1, streamline_dist_ratio));
     int const steps = std::max(1, streamline_steps);
     double const d_time = 0.5 * field.tb->avgAdjLength;
     for (int const i : std::views::iota(0, steps - 1)) {
@@ -245,9 +303,7 @@ void reset_viewer()
     viewer.set_surface_mesh(session->weaving_mesh.mesh());
     sync_field_and_sings();
     if (curl_enabled) {
-        curl_quantity = viewer.set_surface_face_data(
-            session->geodesic_field.face_curl(), "curl");
-        curl_quantity->setEnabled(true);
+        bind_curl_quantity(curl_abs());
     }
     polyscope::view::resetCameraToHomeView();
 }
@@ -257,9 +313,9 @@ void refresh_viewer()
     session->geodesic_field.update_singularities();
     sync_field_and_sings();
     if (curl_quantity != nullptr && curl_enabled) {
-        Eigen::VectorXd const curl = session->geodesic_field.face_curl();
-        curl_quantity->updateData(curl);
-        curl_quantity->setMapRange({ curl.minCoeff(), curl.maxCoeff() });
+        Eigen::VectorXd const mag = curl_abs();
+        curl_quantity->updateData(mag);
+        apply_curl_map_range(mag);
     }
     if (streamlines_enabled) {
         trace_streamlines();
@@ -297,7 +353,7 @@ bool try_load_mesh(std::string const& requested, int preset_index)
     try {
         path = resolve_mesh_path(requested);
         next = std::make_unique<Session>(path);
-        next->geodesic_field.init_smooth();
+        next->geodesic_field.perturb_random();
     } catch (std::exception const& error) {
         std::println("failed to load {}: {}", requested, error.what());
         return false;
@@ -305,11 +361,13 @@ bool try_load_mesh(std::string const& requested, int preset_index)
 
     std::unique_ptr<Session> previous = std::move(session);
     session = std::move(next);
+    capture_original_curl_range();
     try {
         reset_viewer();
     } catch (std::exception const& error) {
         std::println("failed to display {}: {}", path, error.what());
         session = std::move(previous);
+        capture_original_curl_range();
         try {
             reset_viewer();
         } catch (std::exception const& restore_error) {
@@ -322,6 +380,7 @@ bool try_load_mesh(std::string const& requested, int preset_index)
     last_mesh_path = path;
     if (preset_index >= 0 && preset_index < demo_preset_count) {
         selected_preset = preset_index;
+        apply_preset_params(demo_presets[preset_index]);
     } else {
         selected_preset = -1;
         custom_mesh_name = std::filesystem::path(path).filename().string();
@@ -344,38 +403,6 @@ void reload_mesh()
     if (!last_mesh_path.empty()) {
         (void)try_load_mesh(last_mesh_path, -1);
     }
-}
-
-std::vector<std::string> const& data_mesh_files()
-{
-    static std::vector<std::string> files;
-    static bool scanned = false;
-    if (scanned) {
-        return files;
-    }
-    scanned = true;
-    try {
-        for (std::filesystem::directory_entry const& entry :
-            std::filesystem::directory_iterator(DIRECTIONAL_DATA_PATH)) {
-            try {
-                if (!entry.is_regular_file()) {
-                    continue;
-                }
-            } catch (std::exception const&) {
-                continue;
-            }
-            std::string const name = entry.path().filename().string();
-            std::string const ext = mesh_extension(name);
-            if (ext == ".obj" || ext == ".off") {
-                files.push_back(name);
-            }
-        }
-        std::ranges::sort(files);
-    } catch (std::exception const& error) {
-        std::println(
-            "cannot list {}: {}", DIRECTIONAL_DATA_PATH, error.what());
-    }
-    return files;
 }
 
 // Scatter a punctured-face quantity back onto the original faces (0 on
@@ -442,8 +469,7 @@ void accept_initial_scale(InitialScaleResult const& result)
         "initial s: μ {} ({}), {} Lanczos steps, lowest eigenvalues {}, "
         "negative-area fractions {}, low-|s| area fractions {}, chose mode {}",
         result.mu,
-        result.accepted ? "accepted"
-                        : "NO sign-consistent, non-localized mode",
+        result.accepted ? "accepted" : "NO sign-consistent, non-localized mode",
         result.iterations, result.lowest_eigenvalues.transpose(),
         result.negative_area_fractions.transpose(),
         result.low_scale_area_fractions.transpose(), result.chosen_mode);
@@ -477,10 +503,9 @@ void run_initial_scale()
         accept_log_scale(log_integrating_factor(*session->punctured, mu_log));
         return;
     }
-    accept_initial_scale(
-        initial_rescaling(*session->punctured, session->punctured_operators,
-            mu_scale, mu_scale_max, scale_krylov_size, 1e-10, 0.02,
-            max_localized_area));
+    accept_initial_scale(initial_rescaling(*session->punctured,
+        session->punctured_operators, mu_scale, mu_scale_max, scale_krylov_size,
+        1e-10, 0.02, max_localized_area));
 }
 
 void run_rescale()
@@ -546,8 +571,8 @@ void show_leaf_shading(double spacing)
 {
     PuncturedMesh const& punctured = *session->punctured;
     Eigen::MatrixXi const& sub_faces = punctured.sub->mesh().F;
-    Eigen::VectorXd const sub_corners = unwrapped_corner_theta(
-        sub_faces, session->foliation->theta, spacing);
+    Eigen::VectorXd const sub_corners
+        = unwrapped_corner_theta(sub_faces, session->foliation->theta, spacing);
     Eigen::VectorXd corners
         = Eigen::VectorXd::Zero(3 * session->weaving_mesh.mesh().F.rows());
     for (int const face :
@@ -628,9 +653,8 @@ void toggle_leaf_shading()
     if (polyscope::hasCurveNetwork(isolines_name)) {
         polyscope::getCurveNetwork(isolines_name)->setEnabled(!leaf_shading);
     }
-    polyscope::Quantity* quantity
-        = polyscope::getSurfaceMesh(surface_mesh_name)
-              ->getQuantity(leaf_shading_name);
+    polyscope::Quantity* quantity = polyscope::getSurfaceMesh(surface_mesh_name)
+                                        ->getQuantity(leaf_shading_name);
     if (quantity != nullptr) {
         quantity->setEnabled(leaf_shading);
     }
@@ -816,8 +840,8 @@ void tick_initial_s()
         });
     accept_initial_scale(result);
     append_plot(result.rayleigh_quotient);
-    bool const done_mu = result.accepted
-        || job.current_mu >= mu_scale_max * (1.0 + 1e-12);
+    bool const done_mu
+        = result.accepted || job.current_mu >= mu_scale_max * (1.0 + 1e-12);
     if (!done_mu) {
         job.current_mu *= 10.0;
         return;
@@ -975,25 +999,7 @@ void callback()
                 ImGui::SetItemDefaultFocus();
             }
         }
-        ImGui::Separator();
-        for (std::string const& name : data_mesh_files()) {
-            if (name == "torus.obj" || name == "fertility.obj") {
-                continue;
-            }
-            bool const selected
-                = selected_preset < 0 && custom_mesh_name == name;
-            if (ImGui::Selectable(name.c_str(), selected)) {
-                (void)try_load_mesh(
-                    std::string(DIRECTIONAL_DATA_PATH) + "/" + name, -1);
-            }
-        }
         ImGui::EndCombo();
-    }
-    if (ImGui::CollapsingHeader("load mesh")) {
-        ImGui::InputText("path", custom_mesh_path, sizeof custom_mesh_path);
-        if (ImGui::Button("load path")) {
-            (void)try_load_mesh(custom_mesh_path, -1);
-        }
     }
     if (ImGui::Button("reload")) {
         reload_mesh();
@@ -1003,17 +1009,20 @@ void callback()
     }
     if (ImGui::Button("perturb field")) {
         session->geodesic_field.perturb_random();
+        capture_original_curl_range();
         refresh_viewer();
     }
     if (ImGui::Button("toggle curl map")) {
         curl_enabled = !curl_enabled;
         if (curl_enabled) {
-            curl_quantity = viewer.set_surface_face_data(
-                session->geodesic_field.face_curl(), "curl");
-            curl_quantity->setEnabled(true);
+            bind_curl_quantity(curl_abs());
         } else if (curl_quantity != nullptr) {
             curl_quantity->setEnabled(false);
         }
+    }
+    if (ImGui::Checkbox("curl vs original", &curl_vs_original)
+        && curl_enabled) {
+        apply_curl_map_range(curl_abs());
     }
     if (ImGui::Button("toggle singularities")) {
         singularities_enabled = !singularities_enabled;
@@ -1023,20 +1032,12 @@ void callback()
         field_enabled = !field_enabled;
         sync_field_and_sings();
     }
-    ImGui::InputInt("streamline steps", &streamline_steps);
-    ImGui::InputDouble("streamline spacing", &streamline_dist_ratio);
-    if (ImGui::Button("toggle streamlines")) {
-        streamlines_enabled = !streamlines_enabled;
-        if (streamlines_enabled) {
-            trace_streamlines();
-        } else if (streamlines_ready) {
-            viewer.toggle_streamlines(false);
-        }
-    }
-
     ImGui::Separator();
     ImGui::TextUnformatted("Foliation (theta from w)");
+    ImGui::Checkbox("auto isolines per period", &auto_isoline_density);
+    ImGui::BeginDisabled(!auto_isoline_density);
     ImGui::InputDouble("leaf spacing (edges)", &leaf_spacing_edges);
+    ImGui::EndDisabled();
     ImGui::BeginDisabled(auto_isoline_density);
     ImGui::InputInt("isolines per period", &isolines_per_period);
     ImGui::EndDisabled();
@@ -1082,25 +1083,44 @@ void callback()
         ImGui::InputDouble("mu theta (eq. 8)", &mu_theta, 0.0, 0.0, "%.1e");
         ImGui::InputDouble(
             "s prior kappa (eq. 8)", &s_prior_weight, 0.0, 0.0, "%.1e");
-    ImGui::Checkbox("initial s: log integrating factor", &initial_scale_log);
-    ImGui::BeginDisabled(!initial_scale_log);
-    ImGui::InputDouble("mu log", &mu_log, 0.0, 0.0, "%.1e");
-    ImGui::EndDisabled();
+        ImGui::Checkbox(
+            "initial s: log integrating factor", &initial_scale_log);
+        ImGui::BeginDisabled(!initial_scale_log);
+        ImGui::InputDouble("mu log", &mu_log, 0.0, 0.0, "%.1e");
+        ImGui::EndDisabled();
         ImGui::InputDouble("scale multiplier", &scale_multiplier);
         ImGui::InputInt("s krylov size", &scale_krylov_size);
         ImGui::InputInt("theta power iterations", &theta_power_iterations);
         ImGui::InputInt("alternations", &alternations);
         ImGui::InputDouble(
             "max low-s area (eq. 7)", &max_localized_area, 0.0, 0.0, "%.2f");
-        ImGui::Checkbox("auto isolines per period", &auto_isoline_density);
     }
 
     ImGui::EndDisabled();
 }
 
+void register_curl_colormap()
+{
+    auto map = std::make_unique<polyscope::render::ValueColorMap>();
+    map->name = "curl";
+    glm::vec3 const zero { 0.55f, 0.82f, 0.98f };
+    glm::vec3 const mid { 1.0f, 0.90f, 0.20f };
+    glm::vec3 const lots { 0.48f, 0.05f, 0.58f };
+    constexpr int n = 64;
+    map->values.reserve(n);
+    for (int const i : std::views::iota(0, n)) {
+        float const t = static_cast<float>(i) / static_cast<float>(n - 1);
+        map->values.push_back(t < 0.5f
+                ? glm::mix(zero, mid, t * 2.0f)
+                : glm::mix(mid, lots, (t - 0.5f) * 2.0f));
+    }
+    polyscope::render::engine->colorMaps.emplace_back(std::move(map));
+}
+
 int main()
 {
     viewer.init();
+    register_curl_colormap();
     apply_preset(demo_presets[selected_preset]);
     reset_viewer();
     viewer.set_callback(callback);
