@@ -113,26 +113,44 @@ public:
         Eigen::VectorXd curl_per_face(face_count);
         curl_per_face.setZero();
 
+        int const edge_count = tables.edge_faces.rows();
+        int const vertex_count = tables.vertex_positions.rows();
         for (int const face : std::views::iota(0, face_count)) {
             Eigen::RowVector3d const face_vector = field_.extField.row(face);
             double circulation = 0.0;
             for (int const side : std::views::iota(0, 3)) {
-                int const neighbor = tables.face_neighbors(face, side);
-                if (neighbor < 0) {
+                int const edge = tables.face_edges(face, side);
+                if (edge < 0 || edge >= edge_count) {
                     continue;
                 }
-                int const edge = tables.face_edges(face, side);
+                int const left = tables.edge_faces(edge, 0);
+                int const right = tables.edge_faces(edge, 1);
+                int neighbor = -1;
+                if (left == face) {
+                    neighbor = right;
+                } else if (right == face) {
+                    neighbor = left;
+                }
+                if (neighbor < 0 || neighbor >= face_count) {
+                    continue;
+                }
+                int const v0 = tables.edge_vertices(edge, 0);
+                int const v1 = tables.edge_vertices(edge, 1);
+                if (v0 < 0 || v1 < 0 || v0 >= vertex_count
+                    || v1 >= vertex_count) {
+                    continue;
+                }
                 Eigen::RowVector3d edge_vector =
-                    tables.vertex_positions.row(tables.edge_vertices(edge, 1))
-                    - tables.vertex_positions.row(
-                        tables.edge_vertices(edge, 0));
+                    tables.vertex_positions.row(v1)
+                    - tables.vertex_positions.row(v0);
                 if (tables.face_edge_signs(face, side) < 0) {
                     edge_vector = -edge_vector;
                 }
                 circulation += (field_.extField.row(neighbor) - face_vector)
                                    .dot(edge_vector);
             }
-            curl_per_face(face) = circulation / tables.face_areas(face);
+            double const area = tables.face_areas(face);
+            curl_per_face(face) = area > 0.0 ? circulation / area : 0.0;
         }
         return curl_per_face;
     }

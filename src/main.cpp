@@ -8,6 +8,7 @@
 #include "weaving_mesh.h"
 
 #include <directional/directional_viewer.h>
+#include <polyscope/view.h>
 
 #include <algorithm>
 #include <cfloat>
@@ -193,35 +194,73 @@ void trace_streamlines()
     streamlines_ready = true;
 }
 
+void apply_singularity_visibility()
+{
+    if (viewer.psSingList.empty() || viewer.psSingList[0] == nullptr) {
+        return;
+    }
+    viewer.toggle_singularities(singularities_enabled);
+}
+
+void clear_overlays()
+{
+    polyscope::removeStructure(isolines_name, false);
+    clear_streamlines();
+    if (!polyscope::hasSurfaceMesh(surface_mesh_name)) {
+        return;
+    }
+    polyscope::SurfaceMesh* mesh = polyscope::getSurfaceMesh(surface_mesh_name);
+    mesh->removeQuantity("s", false);
+    mesh->removeQuantity("theta", false);
+    mesh->removeQuantity("alignment error", false);
+    mesh->removeQuantity(leaf_shading_name, false);
+    mesh->removeQuantity(punctured_faces_name, false);
+    mesh->removeQuantity(aliased_faces_name, false);
+    mesh->removeQuantity("curl", false);
+}
+
+void sync_field_and_sings()
+{
+    if (field_enabled || singularities_enabled) {
+        viewer.set_cartesian_field(session->geodesic_field.field());
+        if (field_enabled) {
+            viewer.toggle_cartesian_field(true);
+        } else {
+            polyscope::removeStructure("Field 0", false);
+        }
+        apply_singularity_visibility();
+    } else {
+        polyscope::removeStructure("Field 0", false);
+        polyscope::removeStructure("Singularities 0", false);
+    }
+}
+
 void reset_viewer()
 {
     polyscope::removeStructure("Mesh 0", false);
     polyscope::removeStructure("Field 0", false);
     polyscope::removeStructure("Singularities 0", false);
-    polyscope::removeStructure(isolines_name, false);
-    clear_streamlines();
+    clear_overlays();
     curl_quantity = nullptr;
     viewer.set_surface_mesh(session->weaving_mesh.mesh());
-    viewer.set_cartesian_field(session->geodesic_field.field());
-    viewer.toggle_cartesian_field(field_enabled);
-    viewer.toggle_singularities(singularities_enabled);
-    curl_quantity = viewer.set_surface_face_data(
-        session->geodesic_field.face_curl(), "curl");
-    curl_quantity->setEnabled(curl_enabled);
-    if (streamlines_enabled) {
-        trace_streamlines();
+    sync_field_and_sings();
+    if (curl_enabled) {
+        curl_quantity = viewer.set_surface_face_data(
+            session->geodesic_field.face_curl(), "curl");
+        curl_quantity->setEnabled(true);
     }
+    polyscope::view::resetCameraToHomeView();
 }
 
 void refresh_viewer()
 {
     session->geodesic_field.update_singularities();
-    viewer.set_cartesian_field(session->geodesic_field.field());
-    viewer.toggle_cartesian_field(field_enabled);
-    viewer.toggle_singularities(singularities_enabled);
-    Eigen::VectorXd const curl = session->geodesic_field.face_curl();
-    curl_quantity->updateData(curl);
-    curl_quantity->setMapRange({ curl.minCoeff(), curl.maxCoeff() });
+    sync_field_and_sings();
+    if (curl_quantity != nullptr && curl_enabled) {
+        Eigen::VectorXd const curl = session->geodesic_field.face_curl();
+        curl_quantity->updateData(curl);
+        curl_quantity->setMapRange({ curl.minCoeff(), curl.maxCoeff() });
+    }
     if (streamlines_enabled) {
         trace_streamlines();
     } else {
@@ -283,11 +322,9 @@ bool try_load_mesh(std::string const& requested, int preset_index)
     last_mesh_path = path;
     if (preset_index >= 0 && preset_index < demo_preset_count) {
         selected_preset = preset_index;
-        apply_preset_params(demo_presets[preset_index]);
     } else {
         selected_preset = -1;
         custom_mesh_name = std::filesystem::path(path).filename().string();
-        auto_isoline_density = true;
     }
     return true;
 }
@@ -964,17 +1001,27 @@ void callback()
     if (ImGui::Button("optimize")) {
         start_optimize();
     }
+    if (ImGui::Button("perturb field")) {
+        session->geodesic_field.perturb_random();
+        refresh_viewer();
+    }
     if (ImGui::Button("toggle curl map")) {
-        curl_enabled = !curl_quantity->isEnabled();
-        curl_quantity->setEnabled(curl_enabled);
+        curl_enabled = !curl_enabled;
+        if (curl_enabled) {
+            curl_quantity = viewer.set_surface_face_data(
+                session->geodesic_field.face_curl(), "curl");
+            curl_quantity->setEnabled(true);
+        } else if (curl_quantity != nullptr) {
+            curl_quantity->setEnabled(false);
+        }
     }
     if (ImGui::Button("toggle singularities")) {
         singularities_enabled = !singularities_enabled;
-        viewer.toggle_singularities(singularities_enabled);
+        sync_field_and_sings();
     }
     if (ImGui::Button("toggle vector field")) {
         field_enabled = !field_enabled;
-        viewer.toggle_cartesian_field(field_enabled);
+        sync_field_and_sings();
     }
     ImGui::InputInt("streamline steps", &streamline_steps);
     ImGui::InputDouble("streamline spacing", &streamline_dist_ratio);

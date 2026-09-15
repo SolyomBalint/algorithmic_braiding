@@ -5,9 +5,11 @@
 
 #include <cctype>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 inline std::string mesh_extension(std::string const& path)
@@ -36,6 +38,46 @@ inline void validate_triangle_mesh(
     }
     if (faces.minCoeff() < 0 || faces.maxCoeff() >= vertices.rows()) {
         throw std::runtime_error(path + ": face index out of range");
+    }
+
+    std::vector<char> used(static_cast<std::size_t>(vertices.rows()), 0);
+    std::map<std::pair<int, int>, int> edge_face_count;
+    constexpr double area2_floor = 1e-30;
+    for (int face = 0; face < faces.rows(); ++face) {
+        int const a = faces(face, 0);
+        int const b = faces(face, 1);
+        int const c = faces(face, 2);
+        if (a == b || b == c || a == c) {
+            throw std::runtime_error(path + ": degenerate face");
+        }
+        used[static_cast<std::size_t>(a)] = 1;
+        used[static_cast<std::size_t>(b)] = 1;
+        used[static_cast<std::size_t>(c)] = 1;
+        Eigen::RowVector3d const ab
+            = vertices.row(b) - vertices.row(a);
+        Eigen::RowVector3d const ac
+            = vertices.row(c) - vertices.row(a);
+        if (ab.cross(ac).squaredNorm() < area2_floor) {
+            throw std::runtime_error(path + ": degenerate face");
+        }
+        auto add_edge = [&](int u, int v) {
+            if (u > v) {
+                std::swap(u, v);
+            }
+            int& count = edge_face_count[std::pair<int, int>(u, v)];
+            ++count;
+            if (count > 2) {
+                throw std::runtime_error(path + ": non-manifold edge");
+            }
+        };
+        add_edge(a, b);
+        add_edge(b, c);
+        add_edge(c, a);
+    }
+    for (char const seen : used) {
+        if (seen == 0) {
+            throw std::runtime_error(path + ": unused vertex");
+        }
     }
 }
 
@@ -167,6 +209,7 @@ public:
     // Build from explicit geometry (used for the punctured sub-mesh).
     WeavingMesh(Eigen::MatrixXd const& vertices, Eigen::MatrixXi const& faces)
     {
+        validate_triangle_mesh(vertices, faces, "punctured");
         mesh_.set_mesh(vertices, faces);
         tangent_bundle_.init(mesh_);
     }
