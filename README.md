@@ -70,6 +70,14 @@ are 20 to 100 times slower.
 The default GLFW build has no X11 support, so the viewer needs a Wayland
 session.
 
+## Examples
+
+<img width="652" height="971" alt="vase" src="https://github.com/user-attachments/assets/b8f7e030-df97-4914-85b5-f010c3fe8fd8" />
+
+<img width="692" height="920" alt="hand" src="https://github.com/user-attachments/assets/371a7a43-8ad6-425f-9ab4-64584e812a27" />
+
+<img width="771" height="931" alt="pega2" src="https://github.com/user-attachments/assets/8f14e195-12c5-4de6-a20a-a0f1fb917ff3" />
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
